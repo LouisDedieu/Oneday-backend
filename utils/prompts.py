@@ -28,9 +28,10 @@ Return ONLY a raw JSON object (no markdown, no commentary) with this exact struc
       "meals": { "breakfast": "string", "lunch": "string", "dinner": "string" },
       "spots": [
         {
-          "name": "string", "type": "restaurant|museum|beach|viewpoint|activity|shop|other",
+          "name": "string", 
+          "type": "attraction|restaurant|bar|hotel|activite|transport|shopping",
           "address": "string", "duration_minutes": <int|null>,
-          "price_range": "free|budget|mid|expensive|luxury",
+          "price_range": "gratuit|€|€€|€€€|€€€€",
           "price_detail": "string", "tips": "string", "highlight": <bool>
         }
       ]

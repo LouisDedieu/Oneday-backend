@@ -27,7 +27,7 @@ logger = logging.getLogger("bombo.main")
 
 supabase_service = SupabaseService(
     url=settings.supabase_url,
-    key=settings.supabase_service_key,
+    key=settings.SUPABASE_SERVICE_ROLE_KEY,
 )
 
 job_processor = JobProcessor(

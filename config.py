@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # ── Supabase ──────────────────────────────────────────────────────────────
     supabase_url: str = ""
-    supabase_service_key: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
 
 
 settings = Settings()

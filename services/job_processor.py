@@ -49,15 +49,7 @@ class JobProcessor:
         try:
             # Créer le job dans Supabase
             if self.supabase.is_configured():
-                await self.supabase.update_job(
-                    job_id,
-                    {
-                        "id": job_id,
-                        "user_id": request.user_id,
-                        "source_url": request.url,
-                        "status": "pending",
-                    },
-                )
+                await self.supabase.create_job(job_id, request.url, request.user_id)
 
             # ── Étape 1 : Téléchargement ─────────────────────────────────────
             await job_manager.send_sse_update(job_id, "downloading", {"progress": 0})

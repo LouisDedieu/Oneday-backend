@@ -48,14 +48,14 @@ class SupabaseService:
 
             if role != "service_role":
                 logger.warning(
-                    "⚠️  SUPABASE_SERVICE_KEY a le rôle JWT '%s' — attendu 'service_role'. "
+                    "⚠️  SUPABASE_SERVICE_ROLE_KEY a le rôle JWT '%s' — attendu 'service_role'. "
                     "Les insertions seront bloquées par RLS.\n"
                     "→ Supabase dashboard → Settings → API → "
                     "section 'Project API keys' → copiez 'service_role (secret)'.",
                     role,
                 )
             else:
-                logger.info("SUPABASE_SERVICE_KEY = service_role ✓  (RLS bypassed)")
+                logger.info("SUPABASE_SERVICE_ROLE_KEY = service_role ✓  (RLS bypassed)")
         except Exception as e:
             logger.warning("Impossible de décoder le rôle du JWT service key : %s", e)
 
@@ -164,6 +164,26 @@ class SupabaseService:
         )
         return None
 
+    async def create_job(
+            self, job_id: str, url: str, user_id: Optional[str] = None
+    ) -> None:
+        """Crée un job dans analysis_jobs"""
+        if not self.is_configured():
+            return
+        try:
+            await self.insert(
+                "analysis_jobs",
+                {
+                    "id": job_id,
+                    "source_url": url,
+                    "user_id": user_id,
+                    "status": "pending",
+                },
+            )
+            logger.info(f"Job {job_id} créé dans Supabase ✓")
+        except Exception as e:
+            logger.error(f"Erreur création job Supabase: {e}")
+        
     async def update_job(self, job_id: str, updates: Dict):
         """Met à jour un job dans la table analysis_jobs"""
         if not self.is_configured():
@@ -195,6 +215,8 @@ class SupabaseService:
                     headers=self._get_headers(),
                     timeout=10,
                 )
+                if not r.is_success:
+                    logger.error("❌ %s → %s | body: %s", table, r.status_code, r.text)
                 r.raise_for_status()
                 rows = r.json()
                 return rows[0] if rows else {}
