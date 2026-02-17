@@ -5,6 +5,7 @@ import os
 import asyncio
 import logging
 import tempfile
+import json
 from typing import Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -104,6 +105,16 @@ class JobProcessor:
                 error_msg = f"Erreur d'inférence : {exc}"
                 await self._handle_error(job_id, error_msg)
                 return
+
+            # ── Étape Intermédiaire : Sauvegarde locale du raw JSON ──────────────────────
+            results_dir = os.path.join(os.path.dirname(__file__), "results")
+            os.makedirs(results_dir, exist_ok=True)
+
+            json_path = os.path.join(results_dir, f"{job_id}.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+            logger.info("[job %s] raw_json sauvegardé localement : %s", job_id, json_path)
 
             # ── Étape 3 : Sauvegarde dans Supabase ──────────────────────────
             trip_id = None

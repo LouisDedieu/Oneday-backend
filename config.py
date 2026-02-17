@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # ── Optimisations inférence ───────────────────────────────────────────────
     MAX_PIXELS: int = 360 * 420
-    FPS: float = 0.3
+    FPS: float = 0.3 # 1 image tous les 3 secondes → 20 images par minute → 400 images pour une vidéo de 20 minutes
     MAX_NEW_TOKENS: int = 4096
 
     # ── Serveur ───────────────────────────────────────────────────────────────

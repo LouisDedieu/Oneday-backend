@@ -90,3 +90,6 @@ dmypy.json
 
 # ruff
 .ruff_cache/
+
+# results from analysis
+/services/results/

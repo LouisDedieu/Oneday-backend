@@ -93,7 +93,7 @@ class SupabaseService:
             return rows[0] if rows else {}
 
     async def update(
-        self, table: str, payload: Dict, eq_col: str, eq_val: str
+            self, table: str, payload: Dict, eq_col: str, eq_val: str
     ) -> None:
         """Met à jour des lignes via l'API PostgREST"""
         params = {eq_col: f"eq.{eq_val}"}
@@ -183,7 +183,7 @@ class SupabaseService:
             logger.info(f"Job {job_id} créé dans Supabase ✓")
         except Exception as e:
             logger.error(f"Erreur création job Supabase: {e}")
-        
+
     async def update_job(self, job_id: str, updates: Dict):
         """Met à jour un job dans la table analysis_jobs"""
         if not self.is_configured():
@@ -195,7 +195,7 @@ class SupabaseService:
             logger.error(f"Erreur mise à jour Supabase pour job {job_id}: {e}")
 
     async def create_trip(
-        self, trip_data: Dict, job_id: str, user_id: Optional[str] = None
+            self, trip_data: Dict, job_id: str, user_id: Optional[str] = None
     ) -> Optional[str]:
         """
         Crée un voyage complet dans Supabase avec toutes ses relations.
@@ -227,7 +227,9 @@ class SupabaseService:
                 "user_id": user_id,
                 "trip_title": trip_data.get("trip_title"),
                 "vibe": trip_data.get("vibe"),
-                "duration_days": trip_data.get("duration_days", 0),
+                # duration_days n'est pas renseigné ici — le trigger Postgres
+                # trg_update_trip_duration le calcule automatiquement
+                # à chaque INSERT/DELETE sur itinerary_days
                 "best_season": self.normalize_season(trip_data.get("best_season")),
                 "source_url": trip_data.get("source_url"),
                 "content_creator_handle": trip_data.get("content_creator", {}).get(
@@ -257,9 +259,11 @@ class SupabaseService:
             trip_id = trip_row["id"]
             logger.info(f"Trip créé dans Supabase: {trip_id}")
 
-            # 2. Destinations
+            # 2. Destinations — on conserve un mapping city (lower) → destination_id
+            #    pour pouvoir relier les itinerary_days à leur destination sans matching flou côté front
+            city_to_dest_id: dict[str, str] = {}
             for dest in trip_data.get("destinations", []):
-                _sb_insert(
+                dest_row = _sb_insert(
                     "destinations",
                     {
                         "trip_id": trip_id,
@@ -269,14 +273,23 @@ class SupabaseService:
                         "visit_order": dest.get("order", 0),
                     },
                 )
+                if dest_row.get("id") and dest.get("city"):
+                    city_to_dest_id[dest["city"].lower().strip()] = dest_row["id"]
+
+            logger.info(f"city_to_dest_id: {city_to_dest_id}")
 
             # 3. Itinéraire
             for day_data in trip_data.get("itinerary", []):
+                location = day_data.get("location")
+                destination_id = city_to_dest_id.get(location.lower().strip()) if location else None
+
                 day_row_data: dict = {
                     "trip_id": trip_id,
                     "day_number": day_data.get("day"),
-                    "location": day_data.get("location"),
+                    "location": location,
                     "theme": day_data.get("theme"),
+                    "destination_id": destination_id,  # FK vers destinations — renseignée dès l'insertion
+                    "validated": True,                  # tous les jours démarrent validés, l'user choisit en ReviewMode
                 }
 
                 acc = day_data.get("accommodation") or {}
