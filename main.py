@@ -12,7 +12,7 @@ from config import settings
 from services.ml_service import ml_service
 from services.supabase_service import SupabaseService
 from services.job_processor import JobProcessor
-from api import analyze, trips
+from api import analyze, trips, inbox, profile, review
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,9 @@ async def lifespan(app: FastAPI):
     # Configuration des routes avec les services
     analyze.set_job_processor(job_processor)
     trips.set_supabase_service(supabase_service)
+    inbox.set_supabase_service(supabase_service)
+    profile.set_supabase_service(supabase_service)
+    review.set_supabase_service(supabase_service)
 
     logger.info("Application initialisée et prête ✓")
 
@@ -108,6 +111,9 @@ async def health_check():
 # Inclusion des routers
 app.include_router(analyze.router)
 app.include_router(trips.router)
+app.include_router(inbox.router)
+app.include_router(profile.router)
+app.include_router(review.router)
 
 
 # ── Point d'entrée ────────────────────────────────────────────────────────────

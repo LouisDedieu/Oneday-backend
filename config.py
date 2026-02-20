@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     # ── Supabase ──────────────────────────────────────────────────────────────
     supabase_url: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
+    # Dashboard → Settings → API → JWT Settings → JWT Secret
+    SUPABASE_JWT_SECRET: str = ""
 
 
 settings = Settings()

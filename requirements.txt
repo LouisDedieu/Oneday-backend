@@ -17,6 +17,9 @@ httpx>=0.26.0
 # Optional but recommended
 json-repair>=0.7.0
 
+# JWT verification (Supabase tokens)
+PyJWT>=2.8.0
+
 # Development (optional)
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
