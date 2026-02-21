@@ -80,7 +80,7 @@ async def stream_job_status(job_id: str):
             # Attendre les mises à jour avec heartbeat
             while True:
                 try:
-                    message = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    message = await asyncio.wait_for(queue.get(), timeout=10.0)
                     yield f"data: {json.dumps(message)}\n\n"
                     if message.get("status") in ["done", "error"]:
                         break
