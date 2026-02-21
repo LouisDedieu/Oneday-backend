@@ -93,7 +93,7 @@ async def health_check():
     """Vérification de l'état de santé de l'API"""
     return {
         "status": "ok" if ml_service.is_ready() else "loading",
-        "model": settings.MODEL_ID,
+        "model": settings.GEMINI_MODEL_ID,
         "device": ml_service.device or "unknown",
         "model_loaded": ml_service.is_ready(),
         "supabase_connected": supabase_service.is_configured(),
