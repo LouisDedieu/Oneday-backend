@@ -20,3 +20,5 @@ services:
         value: "120"
       - key: PYTHON_VERSION
         value: "3.11.0"
+      - key: PYTHONPATH
+        value: /opt/render/project/src
