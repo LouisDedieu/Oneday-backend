@@ -3,7 +3,7 @@ Routes pour la gestion des trips (voyages)
 """
 import logging
 from typing import List, Dict, Optional
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
@@ -58,6 +58,100 @@ async def get_saved_trips(user_id: str = Depends(get_current_user_id)) -> List[D
         .order("created_at", desc=True) \
         .execute()
     return res.data or []
+
+
+# ── Unified Saved Endpoint ────────────────────────────────────────────────────
+# IMPORTANT: Must be defined BEFORE /{trip_id} to avoid route conflicts
+
+@router.get("/saved/all")
+async def get_unified_saved(
+    user_id: str = Depends(get_current_user_id),
+    type: str = Query("all", regex="^(all|trip|city)$"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> Dict:
+    """
+    Retourne tous les items sauvegardés (trips et/ou cities) avec pagination.
+    Filter: all | trip | city
+    """
+    sb = _require_supabase()
+    offset = (page - 1) * limit
+    items = []
+
+    # Récupérer les trips sauvegardés si demandé
+    if type in ("all", "trip"):
+        trips_res = sb.from_("user_saved_trips") \
+            .select("id, notes, created_at, trips(id, trip_title, vibe, duration_days, thumbnail_url, source_url, content_creator_handle)") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .execute()
+
+        for row in (trips_res.data or []):
+            trip = row.get("trips")
+            if trip:
+                items.append({
+                    "id": row["id"],
+                    "entity_type": "trip",
+                    "entity_id": trip["id"],
+                    "title": trip.get("trip_title", "Sans titre"),
+                    "subtitle": trip.get("vibe") or "",
+                    "thumbnail_url": trip.get("thumbnail_url"),
+                    "vibe": trip.get("vibe"),
+                    "duration_days": trip.get("duration_days"),
+                    "highlights_count": None,
+                    "created_at": row["created_at"],
+                    "notes": row.get("notes"),
+                    "source_url": trip.get("source_url"),
+                    "content_creator_handle": trip.get("content_creator_handle"),
+                })
+
+    # Récupérer les cities sauvegardées si demandé
+    if type in ("all", "city"):
+        cities_res = sb.from_("user_saved_cities") \
+            .select("id, notes, created_at, cities(id, city_title, city_name, country, vibe_tags, thumbnail_url, source_url, content_creator_handle)") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .execute()
+
+        for row in (cities_res.data or []):
+            city = row.get("cities")
+            if city:
+                # Compter les highlights
+                highlights_res = sb.from_("city_highlights") \
+                    .select("id", count="exact") \
+                    .eq("city_id", city["id"]) \
+                    .eq("validated", True) \
+                    .execute()
+
+                items.append({
+                    "id": row["id"],
+                    "entity_type": "city",
+                    "entity_id": city["id"],
+                    "title": city.get("city_title", "Sans titre"),
+                    "subtitle": f"{city.get('city_name', '')}, {city.get('country', '')}".strip(", "),
+                    "thumbnail_url": city.get("thumbnail_url"),
+                    "vibe": city.get("vibe_tags", [None])[0] if city.get("vibe_tags") else None,
+                    "duration_days": None,
+                    "highlights_count": highlights_res.count or 0,
+                    "created_at": row["created_at"],
+                    "notes": row.get("notes"),
+                    "source_url": city.get("source_url"),
+                    "content_creator_handle": city.get("content_creator_handle"),
+                })
+
+    # Trier par date de création (plus récent en premier)
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+
+    # Pagination
+    paginated_items = items[offset:offset + limit]
+
+    return {
+        "items": paginated_items,
+        "page": page,
+        "limit": limit,
+        "total": len(items),
+        "has_more": offset + limit < len(items)
+    }
 
 
 @router.get("/user/{user_id_param}")

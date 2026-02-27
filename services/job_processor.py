@@ -44,6 +44,7 @@ class JobProcessor:
     async def process_url_job(self, job_id: str, request: AnalyzeUrlRequest) -> None:
         """
         Exécute l'analyse en arrière-plan et envoie des mises à jour SSE.
+        Supporte la détection automatique du type (trip/city) ou override manuel.
         """
         tmp_path: Optional[str] = None
 
@@ -84,18 +85,42 @@ class JobProcessor:
                 job_id, "downloading", {"progress": 50}
             )
 
-            # ── Étape 2 : Analyse ────────────────────────────────────────────
-            await job_manager.send_sse_update(job_id, "analyzing", {"progress": 50})
-            if self.supabase.is_configured():
-                await self.supabase.update_job(job_id, {"status": "analyzing"})
+            # ── Étape 2 : Détection du type de contenu ───────────────────────
+            entity_type_override = getattr(request, 'entity_type_override', None)
 
-            logger.info("[job %s] Début de l'inférence", job_id)
+            if entity_type_override and entity_type_override in ('trip', 'city'):
+                entity_type = entity_type_override
+                logger.info("[job %s] Type forcé par l'utilisateur : %s", job_id, entity_type)
+            else:
+                # Auto-détection
+                await job_manager.send_sse_update(
+                    job_id, "analyzing", {"progress": 55, "message": "Détection du type..."}
+                )
+                loop = asyncio.get_event_loop()
+                entity_type = await loop.run_in_executor(
+                    _executor, ml_service.detect_entity_type, output_path
+                )
+
+            # ── Étape 3 : Analyse selon le type ──────────────────────────────
+            await job_manager.send_sse_update(job_id, "analyzing", {"progress": 60})
+            if self.supabase.is_configured():
+                await self.supabase.update_job(job_id, {
+                    "status": "analyzing",
+                    "entity_type": entity_type,
+                })
+
+            logger.info("[job %s] Début de l'inférence (%s)", job_id, entity_type)
 
             try:
                 loop = asyncio.get_event_loop()
-                result, duration = await loop.run_in_executor(
-                    _executor, ml_service.run_inference, output_path
-                )
+                if entity_type == 'city':
+                    result, duration = await loop.run_in_executor(
+                        _executor, ml_service.run_city_inference, output_path
+                    )
+                else:
+                    result, duration = await loop.run_in_executor(
+                        _executor, ml_service.run_inference, output_path
+                    )
                 await job_manager.send_sse_update(
                     job_id, "analyzing", {"progress": 75}
                 )
@@ -106,7 +131,7 @@ class JobProcessor:
                 await self._handle_error(job_id, error_msg)
                 return
 
-            # ── Étape Intermédiaire : Sauvegarde locale du raw JSON ──────────────────────
+            # ── Étape Intermédiaire : Sauvegarde locale du raw JSON ──────────
             results_dir = os.path.join(os.path.dirname(__file__), "results")
             os.makedirs(results_dir, exist_ok=True)
 
@@ -116,43 +141,54 @@ class JobProcessor:
 
             logger.info("[job %s] raw_json sauvegardé localement : %s", job_id, json_path)
 
-            # ── Étape 3 : Sauvegarde dans Supabase ──────────────────────────
+            # ── Étape 4 : Sauvegarde dans Supabase ──────────────────────────
             trip_id = None
+            city_id = None
+
             if self.supabase.is_configured():
                 await job_manager.send_sse_update(
                     job_id, "analyzing", {"progress": 90, "message": "Sauvegarde..."}
                 )
                 # Ajouter l'URL source au résultat avant de sauvegarder
                 result["source_url"] = request.url
-                trip_id = await self.supabase.create_trip(
-                    result, job_id, request.user_id
-                )
+
+                if entity_type == 'city':
+                    city_id = await self.supabase.create_city(
+                        result, job_id, request.user_id
+                    )
+                else:
+                    trip_id = await self.supabase.create_trip(
+                        result, job_id, request.user_id
+                    )
 
             # ── Terminé ─────────────────────────────────────────────────────
-            itinerary = {
+            response_data = {
                 "job_id": job_id,
                 "trip_id": trip_id,
+                "city_id": city_id,
+                "entity_type": entity_type,
                 "duration_seconds": duration,
                 "raw_json": result,
                 "source_url": request.url,
             }
 
-            job_manager.update_job_status(job_id, "done", result=itinerary)
+            job_manager.update_job_status(job_id, "done", result=response_data)
             await job_manager.send_sse_update(
-                job_id, "done", {"result": itinerary, "progress": 100}
+                job_id, "done", {"result": response_data, "progress": 100}
             )
 
             if self.supabase.is_configured():
-                await self.supabase.update_job(
-                    job_id,
-                    {
-                        "status": "done",
-                        "completed_at": datetime.utcnow().isoformat(),
-                        "duration_seconds": duration,
-                    },
-                )
+                update_data = {
+                    "status": "done",
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "duration_seconds": duration,
+                    "entity_type": entity_type,
+                }
+                if city_id:
+                    update_data["city_id"] = city_id
+                await self.supabase.update_job(job_id, update_data)
 
-            logger.info("[job %s] Terminé en %.2fs", job_id, duration)
+            logger.info("[job %s] Terminé en %.2fs (type=%s)", job_id, duration, entity_type)
 
         except Exception as exc:
             logger.exception("[job %s] Erreur inattendue", job_id)

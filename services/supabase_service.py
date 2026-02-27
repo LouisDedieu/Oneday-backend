@@ -361,3 +361,153 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Erreur récupération trips user {user_id}: {e}")
             return []
+
+    # =========================================================================
+    # CITIES
+    # =========================================================================
+
+    async def create_city(
+            self, city_data: Dict, job_id: str, user_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Crée une city complète dans Supabase avec toutes ses relations.
+        Retourne l'ID de la city créée.
+        """
+        if not self.is_configured():
+            return None
+
+        def _do_insert() -> Optional[str]:
+            """Insertion synchrone dans un thread séparé"""
+            import httpx as _httpx
+
+            def _sb_insert(table: str, payload: dict) -> dict:
+                r = _httpx.post(
+                    self._get_url(table),
+                    json=payload,
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if not r.is_success:
+                    logger.error("❌ %s → %s | body: %s", table, r.status_code, r.text)
+                r.raise_for_status()
+                rows = r.json()
+                return rows[0] if rows else {}
+
+            # 1. City principal
+            city_insert = {
+                "job_id": job_id,
+                "user_id": user_id,
+                "city_title": city_data.get("city_title"),
+                "city_name": city_data.get("city_name"),
+                "country": city_data.get("country"),
+                "vibe_tags": city_data.get("vibe_tags", []),
+                "best_season": city_data.get("best_season"),
+                "source_url": city_data.get("source_url"),
+                "content_creator_handle": city_data.get("content_creator", {}).get("handle"),
+                "content_creator_links": city_data.get("content_creator", {}).get("links_mentioned", []),
+            }
+
+            try:
+                city_row = _sb_insert("cities", city_insert)
+            except _httpx.HTTPStatusError as e:
+                body = e.response.text
+                logger.error(f"Erreur création city: {body[:200]}")
+                raise
+
+            city_id = city_row["id"]
+            logger.info(f"City créée dans Supabase: {city_id}")
+
+            # 2. Highlights
+            for idx, highlight in enumerate(city_data.get("highlights", [])):
+                _sb_insert(
+                    "city_highlights",
+                    {
+                        "city_id": city_id,
+                        "name": highlight.get("name"),
+                        "category": highlight.get("category", "other"),
+                        "subtype": highlight.get("subtype"),
+                        "address": highlight.get("address"),
+                        "description": highlight.get("description"),
+                        "price_range": highlight.get("price_range"),
+                        "tips": highlight.get("tips"),
+                        "is_must_see": highlight.get("is_must_see", False),
+                        "highlight_order": idx,
+                        "validated": True,
+                    },
+                )
+
+            # 3. Budget
+            budget = city_data.get("budget") or {}
+            if budget:
+                _sb_insert(
+                    "city_budgets",
+                    {
+                        "city_id": city_id,
+                        "currency": budget.get("currency", "EUR"),
+                        "daily_average": budget.get("daily_average"),
+                        "food_average": budget.get("food_average"),
+                        "transport_average": budget.get("transport_average"),
+                        "activities_average": budget.get("activities_average"),
+                        "accommodation_range": budget.get("accommodation_range"),
+                    },
+                )
+
+            # 4. Infos pratiques
+            practical = city_data.get("practical_info") or {}
+            if practical:
+                _sb_insert(
+                    "city_practical_info",
+                    {
+                        "city_id": city_id,
+                        "visa_required": practical.get("visa_required"),
+                        "local_currency": practical.get("local_currency"),
+                        "language": practical.get("language"),
+                        "best_apps": practical.get("best_apps", []),
+                        "what_to_pack": practical.get("what_to_pack", []),
+                        "safety_tips": practical.get("safety_tips", []),
+                        "things_to_avoid": practical.get("avoid", []),
+                    },
+                )
+
+            logger.info(f"City {city_id} complètement créée dans Supabase ✓")
+            return city_id
+
+        try:
+            return await asyncio.to_thread(_do_insert)
+        except Exception as e:
+            logger.error(f"Erreur création city dans Supabase: {e}")
+            return None
+
+    async def get_city(self, city_id: str) -> Optional[Dict]:
+        """Récupère une city par son ID avec toutes ses relations imbriquées"""
+        if not self.supabase_client:
+            return None
+        try:
+            response = (
+                self.supabase_client.from_("cities")
+                .select("*, city_highlights(*), city_budgets(*), city_practical_info(*)")
+                .eq("id", city_id)
+                .maybe_single()
+                .execute()
+            )
+            return response.data
+        except Exception as e:
+            logger.error(f"Erreur récupération city {city_id}: {e}")
+            return None
+
+    async def get_user_cities(self, user_id: str) -> List[Dict]:
+        """Récupère toutes les cities d'un utilisateur"""
+        if not self.supabase_client:
+            return []
+        try:
+            response = (
+                self.supabase_client.from_("city_details")
+                .select("*")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Erreur récupération cities user {user_id}: {e}")
+            return []

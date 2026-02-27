@@ -26,6 +26,8 @@ def set_supabase_service(service: SupabaseService):
 class InboxJob(BaseModel):
     jobId: str
     tripId: Optional[str]
+    cityId: Optional[str]
+    entityType: str  # 'trip' | 'city'
     title: str
     sourceUrl: str
     platform: str
@@ -34,6 +36,7 @@ class InboxJob(BaseModel):
     progressPct: int
     errorMessage: Optional[str]
     isLocal: bool = False
+    highlightsCount: Optional[int] = None
 
 
 # ── Route ─────────────────────────────────────────────────────────────────────
@@ -42,16 +45,16 @@ class InboxJob(BaseModel):
 async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJob]:
     """
     Retourne la liste des jobs d'analyse de l'utilisateur.
-    Exclut les trips terminés et déjà sauvegardés (= validés).
+    Exclut les trips/cities terminés et déjà sauvegardés (= validés).
     """
     if not _supabase_service or not _supabase_service.supabase_client:
         raise HTTPException(503, detail="Supabase non configuré")
 
     sb = _supabase_service.supabase_client
 
-    # 1. Jobs de l'utilisateur
+    # 1. Jobs de l'utilisateur (with entity_type)
     jobs_res = sb.from_("analysis_jobs") \
-        .select("id, source_url, status, progress_percentage, error_message, created_at") \
+        .select("id, source_url, status, progress_percentage, error_message, created_at, entity_type, city_id") \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
         .execute()
@@ -72,7 +75,27 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
     trip_by_job_id = {t["job_id"]: t for t in trips}
     trip_ids = [t["id"] for t in trips]
 
-    # 3. Trips déjà sauvegardés
+    # 3. Cities liés à ces jobs
+    city_ids_from_jobs = [j["city_id"] for j in jobs if j.get("city_id")]
+    cities_res = sb.from_("cities") \
+        .select("id, city_title") \
+        .in_("id", city_ids_from_jobs) \
+        .execute() if city_ids_from_jobs else None
+
+    cities = cities_res.data if cities_res else []
+    city_by_id = {c["id"]: c for c in cities}
+
+    # 4. Get highlights count for cities
+    highlights_counts = {}
+    if city_ids_from_jobs:
+        for city_id in city_ids_from_jobs:
+            count_res = sb.from_("city_highlights") \
+                .select("id", count="exact") \
+                .eq("city_id", city_id) \
+                .execute()
+            highlights_counts[city_id] = count_res.count or 0
+
+    # 5. Trips déjà sauvegardés
     saved_trip_ids: set = set()
     if trip_ids:
         saved_res = sb.from_("user_saved_trips") \
@@ -82,7 +105,17 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
             .execute()
         saved_trip_ids = {s["trip_id"] for s in (saved_res.data or [])}
 
-    # 4. Construire la réponse — même filtre que le frontend
+    # 6. Cities déjà sauvegardées
+    saved_city_ids: set = set()
+    if city_ids_from_jobs:
+        saved_city_res = sb.from_("user_saved_cities") \
+            .select("city_id") \
+            .eq("user_id", user_id) \
+            .in_("city_id", city_ids_from_jobs) \
+            .execute()
+        saved_city_ids = {s["city_id"] for s in (saved_city_res.data or [])}
+
+    # 7. Construire la réponse
     def detect_platform(url: str) -> str:
         if "tiktok.com" in url.lower():
             return "tiktok"
@@ -92,21 +125,39 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
 
     result = []
     for job in jobs:
+        entity_type = job.get("entity_type") or "trip"
+        city_id = job.get("city_id")
         trip = trip_by_job_id.get(job["id"])
-        # Exclure les trips terminés ET déjà sauvegardés
-        if job["status"] == "done" and trip and trip["id"] in saved_trip_ids:
-            continue
+        city = city_by_id.get(city_id) if city_id else None
+
+        # Exclure les trips/cities terminés ET déjà sauvegardés
+        if job["status"] == "done":
+            if entity_type == "trip" and trip and trip["id"] in saved_trip_ids:
+                continue
+            if entity_type == "city" and city_id and city_id in saved_city_ids:
+                continue
+
+        # Determine title based on entity type
+        if entity_type == "city" and city:
+            title = city["city_title"]
+        elif trip:
+            title = trip["trip_title"]
+        else:
+            title = "Analyse en cours…"
 
         result.append(InboxJob(
             jobId=job["id"],
             tripId=trip["id"] if trip else None,
-            title=trip["trip_title"] if trip else "Analyse en cours…",
+            cityId=city_id,
+            entityType=entity_type,
+            title=title,
             sourceUrl=job["source_url"] or "",
             platform=detect_platform(job["source_url"] or ""),
             createdAt=job["created_at"],
             status=job["status"] or "pending",
             progressPct=job["progress_percentage"] or 0,
             errorMessage=job["error_message"],
+            highlightsCount=highlights_counts.get(city_id) if city_id else None,
         ))
 
     return result
