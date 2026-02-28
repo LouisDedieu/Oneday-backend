@@ -161,3 +161,79 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
         ))
 
     return result
+
+
+@router.delete("/{job_id}")
+async def delete_inbox_job(job_id: str, user_id: str = Depends(get_current_user_id)):
+    """
+    Supprime un job d'analyse et toutes les données associées (trip ou city).
+    """
+    if not _supabase_service or not _supabase_service.supabase_client:
+        raise HTTPException(503, detail="Supabase non configuré")
+
+    sb = _supabase_service.supabase_client
+
+    # 1. Vérifier que le job existe et appartient à l'utilisateur
+    job_res = sb.from_("analysis_jobs") \
+        .select("id, entity_type, city_id") \
+        .eq("id", job_id) \
+        .eq("user_id", user_id) \
+        .maybe_single() \
+        .execute()
+
+    if not job_res.data:
+        raise HTTPException(404, detail="Job non trouvé")
+
+    job = job_res.data
+    entity_type = job.get("entity_type") or "trip"
+    city_id = job.get("city_id")
+
+    # 2. Supprimer l'entité associée (cascade automatique pour les sous-tables)
+    if entity_type == "city" and city_id:
+        # Supprimer les références user_saved_cities
+        sb.from_("user_saved_cities") \
+            .delete() \
+            .eq("city_id", city_id) \
+            .execute()
+
+        # Nullifier city_id dans analysis_jobs pour éviter la contrainte FK
+        sb.from_("analysis_jobs") \
+            .update({"city_id": None}) \
+            .eq("id", job_id) \
+            .execute()
+
+        # Supprimer la city (cascade: city_highlights, city_budgets, city_practical_info)
+        sb.from_("cities") \
+            .delete() \
+            .eq("id", city_id) \
+            .execute()
+    else:
+        # Chercher le trip lié à ce job
+        trip_res = sb.from_("trips") \
+            .select("id") \
+            .eq("job_id", job_id) \
+            .maybe_single() \
+            .execute()
+
+        if trip_res.data:
+            trip_id = trip_res.data["id"]
+
+            # Supprimer les références user_saved_trips
+            sb.from_("user_saved_trips") \
+                .delete() \
+                .eq("trip_id", trip_id) \
+                .execute()
+
+            # Supprimer le trip (cascade: destinations, itinerary_days, spots, logistics, budgets, practical_info)
+            sb.from_("trips") \
+                .delete() \
+                .eq("id", trip_id) \
+                .execute()
+
+    # 3. Supprimer le job d'analyse
+    sb.from_("analysis_jobs") \
+        .delete() \
+        .eq("id", job_id) \
+        .execute()
+
+    return {"deleted": True}
