@@ -412,10 +412,17 @@ async def add_city_to_trip(
             "location": city_name,
             "theme": f"Découverte de {city_name}",
             "validated": True,
+            "linked_city_id": body.city_id,  # Lien pour sync automatique
         }).execute()
 
         if new_day_res.data:
             target_day_id = new_day_res.data[0]["id"]
+    else:
+        # Si on ajoute à un jour existant, mettre à jour linked_city_id
+        sb.from_("itinerary_days") \
+            .update({"linked_city_id": body.city_id}) \
+            .eq("id", target_day_id) \
+            .execute()
 
     # 4. Récupérer le max spot_order du jour cible
     max_spot_order = 0
@@ -458,6 +465,9 @@ async def add_city_to_trip(
             "spot_order": max_spot_order + idx,
             "latitude": h.get("latitude"),
             "longitude": h.get("longitude"),
+            # Lien vers le highlight source pour synchronisation
+            "city_highlight_id": h["id"],
+            "source_city_id": body.city_id,
         })
 
     if spots_to_insert:
@@ -653,8 +663,10 @@ async def reorder_destinations(
     body: ReorderDestinationsBody,
     user_id: str = Depends(get_current_user_id),
 ) -> Dict:
-    """Met à jour visit_order de chaque destination d'un trip."""
+    """Met à jour visit_order de chaque destination et réordonne les itinerary_days."""
     sb = _require_supabase()
+
+    # 1. Mettre à jour visit_order des destinations
     await asyncio.gather(*[
         asyncio.to_thread(
             lambda d=dest: sb.from_("destinations")
@@ -665,4 +677,53 @@ async def reorder_destinations(
         )
         for dest in body.destinations
     ])
+
+    # 2. Récupérer tous les jours du trip
+    days_res = await asyncio.to_thread(
+        lambda: sb.from_("itinerary_days")
+            .select("id, destination_id, day_number")
+            .eq("trip_id", trip_id)
+            .execute()
+    )
+    all_days = days_res.data or []
+
+    if not all_days:
+        return {"reordered": True}
+
+    # 3. Créer un mapping destination_id -> visit_order
+    dest_order_map = {dest.id: dest.order for dest in body.destinations}
+
+    # 4. Grouper les jours par destination_id et trier par day_number interne
+    from collections import defaultdict
+    days_by_dest: Dict[str, list] = defaultdict(list)
+    for day in all_days:
+        dest_id = day.get("destination_id")
+        if dest_id:
+            days_by_dest[dest_id].append(day)
+
+    # Trier chaque groupe par day_number existant (pour préserver l'ordre relatif interne)
+    for dest_id in days_by_dest:
+        days_by_dest[dest_id].sort(key=lambda d: d.get("day_number", 0))
+
+    # 5. Reconstruire l'ordre global des jours selon le nouvel ordre des destinations
+    sorted_dest_ids = sorted(
+        days_by_dest.keys(),
+        key=lambda did: dest_order_map.get(did, 999)
+    )
+
+    new_day_order = []
+    for dest_id in sorted_dest_ids:
+        new_day_order.extend(days_by_dest[dest_id])
+
+    # 6. Mettre à jour day_number de chaque jour
+    await asyncio.gather(*[
+        asyncio.to_thread(
+            lambda day_id=day["id"], new_num=idx + 1: sb.from_("itinerary_days")
+                .update({"day_number": new_num})
+                .eq("id", day_id)
+                .execute()
+        )
+        for idx, day in enumerate(new_day_order)
+    ])
+
     return {"reordered": True}

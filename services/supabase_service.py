@@ -329,18 +329,180 @@ class SupabaseService:
             return None
 
     async def get_trip(self, trip_id: str) -> Optional[Dict]:
-        """Récupère un trip par son ID avec toutes ses relations imbriquées"""
+        """
+        Récupère un trip par son ID avec toutes ses relations imbriquées.
+        Synchronise automatiquement les spots avec les highlights des villes liées.
+        """
         if not self.supabase_client:
             return None
         try:
+            # 1. Récupérer le trip avec toutes ses relations
             response = (
                 self.supabase_client.from_("trips")
-                .select("*, destinations(*), itinerary_days(*, spots(*)), logistics(*), budgets(*), practical_info(*)")
+                .select(
+                    "*, destinations(*), "
+                    "itinerary_days(*, spots(*)), "
+                    "logistics(*), budgets(*), practical_info(*)"
+                )
                 .eq("id", trip_id)
                 .maybe_single()
                 .execute()
             )
-            return response.data
+            trip_data = response.data
+            if not trip_data:
+                return None
+
+            # 2. Identifier les jours liés à des villes sauvegardées
+            days_with_city = [
+                day for day in trip_data.get("itinerary_days", [])
+                if day.get("linked_city_id")
+            ]
+
+            if not days_with_city:
+                # Pas de sync nécessaire, retourner tel quel
+                return trip_data
+
+            # 3. Récupérer les city_ids uniques
+            city_ids = list(set(day["linked_city_id"] for day in days_with_city))
+
+            # 4. Récupérer tous les highlights validés de ces villes
+            highlights_res = (
+                self.supabase_client.from_("city_highlights")
+                .select("*")
+                .in_("city_id", city_ids)
+                .eq("validated", True)
+                .order("highlight_order")
+                .execute()
+            )
+            all_highlights = highlights_res.data or []
+
+            # Grouper les highlights par city_id
+            highlights_by_city: Dict[str, list] = {}
+            for h in all_highlights:
+                cid = h["city_id"]
+                if cid not in highlights_by_city:
+                    highlights_by_city[cid] = []
+                highlights_by_city[cid].append(h)
+
+            # Mapping catégorie → spot_type
+            CATEGORY_TO_SPOT_TYPE = {
+                "food": "restaurant",
+                "culture": "attraction",
+                "nature": "attraction",
+                "shopping": "shopping",
+                "nightlife": "bar",
+                "other": "attraction",
+            }
+
+            # 5. Synchroniser chaque jour lié
+            for day in days_with_city:
+                city_id = day["linked_city_id"]
+                day_id = day["id"]
+                city_highlights = highlights_by_city.get(city_id, [])
+                existing_spots = day.get("spots", [])
+
+                # Map des spots existants par city_highlight_id
+                spots_by_highlight_id = {
+                    s["city_highlight_id"]: s
+                    for s in existing_spots
+                    if s.get("city_highlight_id")
+                }
+
+                # Set des highlight_ids actuels de la ville
+                current_highlight_ids = {h["id"] for h in city_highlights}
+
+                # Set des highlight_ids déjà liés dans les spots
+                linked_highlight_ids = set(spots_by_highlight_id.keys())
+
+                # a) Highlights à ajouter (nouveaux)
+                to_add = [h for h in city_highlights if h["id"] not in linked_highlight_ids]
+
+                # b) Spots à supprimer (highlight supprimé de la ville)
+                to_delete_ids = [
+                    s["id"] for s in existing_spots
+                    if s.get("city_highlight_id") and s["city_highlight_id"] not in current_highlight_ids
+                ]
+
+                # c) Spots à mettre à jour (highlight modifié)
+                to_update = [
+                    (spots_by_highlight_id[h["id"]], h)
+                    for h in city_highlights
+                    if h["id"] in linked_highlight_ids
+                ]
+
+                # Exécuter les suppressions
+                if to_delete_ids:
+                    self.supabase_client.from_("spots") \
+                        .delete() \
+                        .in_("id", to_delete_ids) \
+                        .execute()
+
+                # Exécuter les mises à jour
+                for spot, highlight in to_update:
+                    category = highlight.get("category", "other")
+                    spot_type = CATEGORY_TO_SPOT_TYPE.get(category, "attraction")
+                    self.supabase_client.from_("spots") \
+                        .update({
+                            "name": highlight["name"],
+                            "address": highlight.get("address"),
+                            "tips": highlight.get("tips"),
+                            "price_range": highlight.get("price_range"),
+                            "latitude": highlight.get("latitude"),
+                            "longitude": highlight.get("longitude"),
+                            "highlight": highlight.get("is_must_see", False),
+                            "spot_type": spot_type,
+                        }) \
+                        .eq("id", spot["id"]) \
+                        .execute()
+
+                # Calculer le prochain spot_order
+                max_order = max((s.get("spot_order", 0) for s in existing_spots), default=0)
+
+                # Exécuter les insertions
+                if to_add:
+                    spots_to_insert = []
+                    for idx, h in enumerate(to_add):
+                        category = h.get("category", "other")
+                        spot_type = CATEGORY_TO_SPOT_TYPE.get(category, "attraction")
+                        spots_to_insert.append({
+                            "itinerary_day_id": day_id,
+                            "name": h["name"],
+                            "spot_type": spot_type,
+                            "address": h.get("address"),
+                            "duration_minutes": 60,
+                            "price_range": h.get("price_range"),
+                            "tips": h.get("tips"),
+                            "highlight": h.get("is_must_see", False),
+                            "spot_order": max_order + idx + 1,
+                            "latitude": h.get("latitude"),
+                            "longitude": h.get("longitude"),
+                            "city_highlight_id": h["id"],
+                            "source_city_id": city_id,
+                        })
+                    self.supabase_client.from_("spots").insert(spots_to_insert).execute()
+
+            # 6. Re-fetch le trip avec les données synchronisées
+            response = (
+                self.supabase_client.from_("trips")
+                .select(
+                    "*, destinations(*), "
+                    "itinerary_days(*, spots(*)), "
+                    "logistics(*), budgets(*), practical_info(*)"
+                )
+                .eq("id", trip_id)
+                .maybe_single()
+                .execute()
+            )
+            trip_data = response.data
+
+            # 7. Marquer les spots synchronisés pour le frontend
+            if trip_data:
+                for day in trip_data.get("itinerary_days", []):
+                    for spot in day.get("spots", []):
+                        if spot.get("city_highlight_id"):
+                            spot["_synced_from_highlight"] = True
+
+            return trip_data
         except Exception as e:
             logger.error(f"Erreur récupération trip {trip_id}: {e}")
             return None
