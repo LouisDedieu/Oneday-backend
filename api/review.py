@@ -702,64 +702,96 @@ async def reorder_destinations(
     """Met à jour visit_order de chaque destination et réordonne les itinerary_days."""
     sb = _require_supabase()
 
-    # 1. Mettre à jour visit_order des destinations
-    await asyncio.gather(*[
-        asyncio.to_thread(
-            lambda d=dest: sb.from_("destinations")
-                .update({"visit_order": d.order})
-                .eq("id", d.id)
+    try:
+        # 0. Vérifier que les destinations appartiennent au trip
+        dest_ids = [d.id for d in body.destinations]
+        if dest_ids:
+            check_res = await asyncio.to_thread(
+                lambda: sb.from_("destinations")
+                    .select("id")
+                    .eq("trip_id", trip_id)
+                    .in_("id", dest_ids)
+                    .execute()
+            )
+            found_ids = {d["id"] for d in (check_res.data or [])}
+            missing = set(dest_ids) - found_ids
+            if missing:
+                raise HTTPException(404, detail=f"Destinations introuvables: {missing}")
+
+        # 1. Mettre à jour visit_order des destinations
+        # D'abord mettre des valeurs temporaires négatives pour éviter les conflits d'unicité
+        if body.destinations:
+            for i, dest in enumerate(body.destinations):
+                await asyncio.to_thread(
+                    lambda d=dest, idx=i: sb.from_("destinations")
+                        .update({"visit_order": -(idx + 1000)})
+                        .eq("id", d.id)
+                        .eq("trip_id", trip_id)
+                        .execute()
+                )
+            # Puis mettre les vraies valeurs
+            for dest in body.destinations:
+                await asyncio.to_thread(
+                    lambda d=dest: sb.from_("destinations")
+                        .update({"visit_order": d.order})
+                        .eq("id", d.id)
+                        .eq("trip_id", trip_id)
+                        .execute()
+                )
+
+        # 2. Récupérer tous les jours du trip
+        days_res = await asyncio.to_thread(
+            lambda: sb.from_("itinerary_days")
+                .select("id, destination_id, day_number")
                 .eq("trip_id", trip_id)
                 .execute()
         )
-        for dest in body.destinations
-    ])
+        all_days = days_res.data or []
 
-    # 2. Récupérer tous les jours du trip
-    days_res = await asyncio.to_thread(
-        lambda: sb.from_("itinerary_days")
-            .select("id, destination_id, day_number")
-            .eq("trip_id", trip_id)
-            .execute()
-    )
-    all_days = days_res.data or []
+        if not all_days:
+            return {"reordered": True}
 
-    if not all_days:
+        # 3. Créer un mapping destination_id -> visit_order
+        dest_order_map = {dest.id: dest.order for dest in body.destinations}
+
+        # 4. Grouper les jours par destination_id et trier par day_number interne
+        from collections import defaultdict
+        days_by_dest: Dict[str, list] = defaultdict(list)
+        for day in all_days:
+            dest_id = day.get("destination_id")
+            if dest_id:
+                days_by_dest[dest_id].append(day)
+
+        # Trier chaque groupe par day_number existant (pour préserver l'ordre relatif interne)
+        for dest_id in days_by_dest:
+            days_by_dest[dest_id].sort(key=lambda d: d.get("day_number", 0))
+
+        # 5. Reconstruire l'ordre global des jours selon le nouvel ordre des destinations
+        sorted_dest_ids = sorted(
+            days_by_dest.keys(),
+            key=lambda did: dest_order_map.get(did, 999)
+        )
+
+        new_day_order = []
+        for dest_id in sorted_dest_ids:
+            new_day_order.extend(days_by_dest[dest_id])
+
+        # 6. Mettre à jour day_number de chaque jour
+        if new_day_order:
+            await asyncio.gather(*[
+                asyncio.to_thread(
+                    lambda day_id=day["id"], new_num=idx + 1: sb.from_("itinerary_days")
+                        .update({"day_number": new_num})
+                        .eq("id", day_id)
+                        .execute()
+                )
+                for idx, day in enumerate(new_day_order)
+            ])
+
         return {"reordered": True}
 
-    # 3. Créer un mapping destination_id -> visit_order
-    dest_order_map = {dest.id: dest.order for dest in body.destinations}
-
-    # 4. Grouper les jours par destination_id et trier par day_number interne
-    from collections import defaultdict
-    days_by_dest: Dict[str, list] = defaultdict(list)
-    for day in all_days:
-        dest_id = day.get("destination_id")
-        if dest_id:
-            days_by_dest[dest_id].append(day)
-
-    # Trier chaque groupe par day_number existant (pour préserver l'ordre relatif interne)
-    for dest_id in days_by_dest:
-        days_by_dest[dest_id].sort(key=lambda d: d.get("day_number", 0))
-
-    # 5. Reconstruire l'ordre global des jours selon le nouvel ordre des destinations
-    sorted_dest_ids = sorted(
-        days_by_dest.keys(),
-        key=lambda did: dest_order_map.get(did, 999)
-    )
-
-    new_day_order = []
-    for dest_id in sorted_dest_ids:
-        new_day_order.extend(days_by_dest[dest_id])
-
-    # 6. Mettre à jour day_number de chaque jour
-    await asyncio.gather(*[
-        asyncio.to_thread(
-            lambda day_id=day["id"], new_num=idx + 1: sb.from_("itinerary_days")
-                .update({"day_number": new_num})
-                .eq("id", day_id)
-                .execute()
-        )
-        for idx, day in enumerate(new_day_order)
-    ])
-
-    return {"reordered": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reordering destinations for trip {trip_id}: {e}")
+        raise HTTPException(500, detail=f"Erreur lors du réordonnancement: {str(e)}")
