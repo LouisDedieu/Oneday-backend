@@ -3,6 +3,7 @@ Routes pour la gestion des trips (voyages)
 """
 import logging
 from typing import List, Dict, Optional
+from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
@@ -82,6 +83,7 @@ async def get_unified_saved(
     any_table_hit_limit = False
 
     # Récupérer les trips sauvegardés si demandé
+    trip_days_map = {}  # trip_id -> [{"day_number": X, "spots_count": Y}, ...]
     if item_type in ("all", "trip"):
         trips_res = sb.from_("user_saved_trips") \
             .select("id, notes, created_at, trips(id, trip_title, vibe, duration_days, thumbnail_url, source_url, content_creator_handle)") \
@@ -91,6 +93,32 @@ async def get_unified_saved(
             .execute()
         if len(trips_res.data or []) == db_limit:
             any_table_hit_limit = True
+
+        # Collecter les trip_ids pour requête groupée
+        trip_entity_ids = [trip["id"] for row in (trips_res.data or []) if (trip := row.get("trips"))]
+
+        # Requête groupée pour spots par jour
+        if trip_entity_ids:
+            days_res = sb.from_("itinerary_days") \
+                .select("trip_id, day_number, spots(id)") \
+                .in_("trip_id", trip_entity_ids) \
+                .eq("validated", True) \
+                .execute()
+
+            # Grouper par trip_id, puis par day_number, compter les spots
+            trip_days_raw = defaultdict(lambda: defaultdict(int))
+            for day_row in (days_res.data or []):
+                tid = day_row.get("trip_id")
+                day_num = day_row.get("day_number")
+                spots = day_row.get("spots") or []
+                trip_days_raw[tid][day_num] += len(spots)
+
+            # Convertir en format final
+            for tid, days_dict in trip_days_raw.items():
+                trip_days_map[tid] = [
+                    {"day_number": d, "spots_count": c}
+                    for d, c in sorted(days_dict.items())
+                ]
 
         for row in (trips_res.data or []):
             trip = row.get("trips")
@@ -109,9 +137,11 @@ async def get_unified_saved(
                     "notes": row.get("notes"),
                     "source_url": trip.get("source_url"),
                     "content_creator_handle": trip.get("content_creator_handle"),
+                    "days": trip_days_map.get(trip["id"], []),
                 })
 
     # Récupérer les cities sauvegardées si demandé
+    city_categories_map = {}  # city_id -> [{"category": X, "count": Y}, ...]
     if item_type in ("all", "city"):
         # city_details contient déjà highlights_count — une seule requête au lieu de 1+N
         cities_res = sb.from_("user_saved_cities") \
@@ -122,6 +152,32 @@ async def get_unified_saved(
             .execute()
         if len(cities_res.data or []) == db_limit:
             any_table_hit_limit = True
+
+        # Collecter les city_ids pour requête groupée
+        city_entity_ids = [city["id"] for row in (cities_res.data or []) if (city := row.get("city_details"))]
+
+        # Requête groupée pour highlights par catégorie
+        if city_entity_ids:
+            highlights_res = sb.from_("city_highlights") \
+                .select("city_id, category") \
+                .in_("city_id", city_entity_ids) \
+                .eq("validated", True) \
+                .execute()
+
+            # Grouper par city_id, puis par category, compter
+            city_cats_raw = defaultdict(lambda: defaultdict(int))
+            for hl_row in (highlights_res.data or []):
+                cid = hl_row.get("city_id")
+                cat = hl_row.get("category")
+                if cat:
+                    city_cats_raw[cid][cat] += 1
+
+            # Convertir en format final
+            for cid, cats_dict in city_cats_raw.items():
+                city_categories_map[cid] = [
+                    {"category": c, "count": cnt}
+                    for c, cnt in sorted(cats_dict.items(), key=lambda x: -x[1])  # tri par count décroissant
+                ]
 
         for row in (cities_res.data or []):
             city = row.get("city_details")
@@ -140,6 +196,7 @@ async def get_unified_saved(
                     "notes": row.get("notes"),
                     "source_url": city.get("source_url"),
                     "content_creator_handle": city.get("content_creator_handle"),
+                    "categories": city_categories_map.get(city["id"], []),
                 })
 
     # Trier par date de création (plus récent en premier)
