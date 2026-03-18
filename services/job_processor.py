@@ -14,6 +14,7 @@ from models.schemas import AnalyzeUrlRequest
 from services.ml_service import ml_service
 from services.supabase_service import SupabaseService
 from services.sse_service import job_manager
+from services.notification_service import NotificationService
 from downloader import (
     download_video,
     UnsupportedURLError,
@@ -40,6 +41,7 @@ class JobProcessor:
         self.supabase = supabase_service
         self.default_cookies_file = cookies_file
         self.default_proxy = proxy
+        self.notification_service = NotificationService(supabase_service)
 
     async def process_url_job(self, job_id: str, request: AnalyzeUrlRequest) -> None:
         """
@@ -74,10 +76,10 @@ class JobProcessor:
 
             except UnsupportedURLError:
                 error_msg = "URL non supportée (accepte TikTok, Instagram Reels)."
-                await self._handle_error(job_id, error_msg)
+                await self._handle_error(job_id, error_msg, request.user_id, request.url)
                 return
             except (PrivateVideoError, IPBlockedError, DownloadError) as exc:
-                await self._handle_error(job_id, str(exc))
+                await self._handle_error(job_id, str(exc), request.user_id, request.url)
                 return
 
             logger.info("[job %s] Vidéo téléchargée : %s", job_id, output_path)
@@ -128,7 +130,7 @@ class JobProcessor:
             except Exception as exc:
                 logger.exception("[job %s] Erreur lors de l'inférence", job_id)
                 error_msg = f"Erreur d'inférence : {exc}"
-                await self._handle_error(job_id, error_msg)
+                await self._handle_error(job_id, error_msg, request.user_id, request.url)
                 return
 
             # ── Étape Intermédiaire : Sauvegarde locale du raw JSON ──────────
@@ -190,10 +192,26 @@ class JobProcessor:
 
             logger.info("[job %s] Terminé en %.2fs (type=%s)", job_id, duration, entity_type)
 
+            # ── Notification de succès ─────────────────────────────────────
+            if request.user_id:
+                entity_id = city_id if entity_type == "city" else trip_id
+                entity_title = result.get("city_title") if entity_type == "city" else result.get("trip_title")
+                if entity_id and entity_title:
+                    try:
+                        await self.notification_service.notify_analysis_complete(
+                            user_id=request.user_id,
+                            entity_type=entity_type,
+                            entity_id=entity_id,
+                            title=entity_title,
+                            source_url=request.url,
+                        )
+                    except Exception as notif_exc:
+                        logger.warning("[job %s] Erreur notification succès: %s", job_id, notif_exc)
+
         except Exception as exc:
             logger.exception("[job %s] Erreur inattendue", job_id)
             error_msg = f"Erreur inattendue : {exc}"
-            await self._handle_error(job_id, error_msg)
+            await self._handle_error(job_id, error_msg, request.user_id, request.url)
 
         finally:
             # Supprimer le fichier temporaire
@@ -210,7 +228,13 @@ class JobProcessor:
                         e,
                     )
 
-    async def _handle_error(self, job_id: str, error_msg: str) -> None:
+    async def _handle_error(
+        self,
+        job_id: str,
+        error_msg: str,
+        user_id: Optional[str] = None,
+        source_url: Optional[str] = None,
+    ) -> None:
         """Gère les erreurs de traitement de job"""
         job_manager.update_job_status(job_id, "error", error=error_msg)
         await job_manager.send_sse_update(job_id, "error", {"error": error_msg})
@@ -218,6 +242,20 @@ class JobProcessor:
             await self.supabase.update_job(
                 job_id, {"status": "error", "error_message": error_msg}
             )
+
+        # Envoyer une notification d'erreur
+        if user_id:
+            try:
+                error_code = NotificationService.extract_error_code(error_msg)
+                await self.notification_service.notify_analysis_error(
+                    user_id=user_id,
+                    job_id=job_id,
+                    error_code=error_code,
+                    source_url=source_url,
+                    error_message=error_msg,
+                )
+            except Exception as notif_exc:
+                logger.warning("[job %s] Erreur notification erreur: %s", job_id, notif_exc)
 
     def shutdown(self):
         """Arrête le processeur de jobs"""
