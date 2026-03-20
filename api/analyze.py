@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from datetime import datetime
 
 from models.schemas import AnalyzeUrlRequest, JobResponse, JobStatusResponse
+from models.errors import ErrorCode, get_error_message
 from services.ml_service import ml_service
 from services.sse_service import job_manager
 from services.job_processor import JobProcessor
@@ -42,9 +43,15 @@ async def analyze_video_url(
     recevoir les mises à jour en temps réel via Server-Sent Events.
     """
     if not _job_processor:
-        raise HTTPException(503, detail="Le service d'analyse n'est pas disponible.")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
     if not ml_service.is_ready():
-        raise HTTPException(503, detail="Le modèle n'est pas encore chargé.")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.MODEL_NOT_LOADED,
+            "message": get_error_message(ErrorCode.MODEL_NOT_LOADED),
+        })
 
     job_id = str(uuid.uuid4())
     job_manager.create_job(job_id, user_id)
@@ -63,7 +70,10 @@ async def stream_job_status(
     """Stream SSE des mises à jour du job d'analyse."""
     job = job_manager.get_job(job_id)
     if not job or job.get("user_id") != user_id:
-        raise HTTPException(404, detail="Job introuvable")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.JOB_NOT_FOUND,
+            "message": get_error_message(ErrorCode.JOB_NOT_FOUND),
+        })
 
     queue = asyncio.Queue()
     job_manager.add_sse_queue(job_id, queue)
@@ -123,7 +133,10 @@ async def get_job_status(
     """Fallback polling — préférer /analyze/stream/{job_id}."""
     job = job_manager.get_job(job_id)
     if not job or job.get("user_id") != user_id:
-        raise HTTPException(404, detail="Job introuvable")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.JOB_NOT_FOUND,
+            "message": get_error_message(ErrorCode.JOB_NOT_FOUND),
+        })
 
     return JobStatusResponse(
         job_id=job_id,

@@ -7,6 +7,8 @@ import httpx
 from typing import Optional, Dict, List, Any
 from enum import Enum
 
+from models.errors import ErrorCode, get_error_message
+
 logger = logging.getLogger("bombo.notification_service")
 
 EXPO_PUSH_API_URL = "https://exp.host/--/api/v2/push/send"
@@ -343,14 +345,14 @@ class NotificationService:
         error_msg_lower = error_msg.lower()
 
         if "private" in error_msg_lower or "privée" in error_msg_lower:
-            return "private_video"
+            return ErrorCode.PRIVATE_VIDEO.value
         if "ip" in error_msg_lower and "block" in error_msg_lower:
-            return "ip_blocked"
+            return ErrorCode.IP_BLOCKED.value
         if "unsupported" in error_msg_lower or "non supportée" in error_msg_lower:
-            return "unsupported_url"
+            return ErrorCode.UNSUPPORTED_URL.value
         if "download" in error_msg_lower or "télécharg" in error_msg_lower:
-            return "download_error"
+            return ErrorCode.DOWNLOAD_ERROR.value
         if "inférence" in error_msg_lower or "inference" in error_msg_lower:
-            return "inference_error"
+            return ErrorCode.INFERENCE_ERROR.value
 
-        return "unknown_error"
+        return ErrorCode.UNKNOWN_ERROR.value

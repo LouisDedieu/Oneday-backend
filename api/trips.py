@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.trips")
 
@@ -24,7 +25,10 @@ def set_supabase_service(service: SupabaseService):
 
 def _require_supabase():
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configuré")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
     return _supabase_service.supabase_client
 
 
@@ -238,11 +242,17 @@ async def is_trip_saved(
 async def get_trip(trip_id: str) -> Dict:
     """Récupère les détails d'un voyage par son ID."""
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configuré")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
 
     trip = await _supabase_service.get_trip(trip_id)
     if not trip:
-        raise HTTPException(404, detail="Voyage introuvable")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.TRIP_NOT_FOUND,
+            "message": get_error_message(ErrorCode.TRIP_NOT_FOUND),
+        })
 
     return trip
 
@@ -257,7 +267,10 @@ async def delete_trip(
     # Vérifier ownership et récupérer job_id
     res = sb.from_("trips").select("id, job_id").eq("id", trip_id).eq("user_id", user_id).maybe_single().execute()
     if not res.data:
-        raise HTTPException(404, detail="Trip introuvable ou accès refusé")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.TRIP_NOT_FOUND,
+            "message": get_error_message(ErrorCode.TRIP_NOT_FOUND),
+        })
 
     job_id = res.data.get("job_id")
 

@@ -8,6 +8,8 @@ import jwt
 from config import settings
 from fastapi import Header, HTTPException
 
+from models.errors import ErrorCode, get_error_message
+
 logger = logging.getLogger("bombo.auth")
 
 # Cache du client JWKS (évite de re-fetcher les clés à chaque requête)
@@ -29,7 +31,10 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
     Retourne le user_id (sub) si valide, sinon lève une 401.
     """
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Non authentifié")
+        raise HTTPException(status_code=401, detail={
+            "error_code": ErrorCode.NOT_AUTHENTICATED,
+            "message": get_error_message(ErrorCode.NOT_AUTHENTICATED),
+        })
 
     token = authorization[7:]
 
@@ -38,7 +43,10 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
         alg = header.get("alg", "")
 
         if alg not in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512"):
-            raise HTTPException(status_code=401, detail="Non authentifié")
+            raise HTTPException(status_code=401, detail={
+                "error_code": ErrorCode.NOT_AUTHENTICATED,
+                "message": get_error_message(ErrorCode.NOT_AUTHENTICATED),
+            })
 
         jwks_client = _get_jwks_client()
         signing_key = jwks_client.get_signing_key_from_jwt(token)
@@ -51,7 +59,10 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
 
         user_id: str | None = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Token invalide")
+            raise HTTPException(status_code=401, detail={
+                "error_code": ErrorCode.INVALID_TOKEN,
+                "message": get_error_message(ErrorCode.INVALID_TOKEN),
+            })
 
         return user_id
 
@@ -59,4 +70,7 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
         raise
     except Exception as exc:
         logger.warning("Erreur de vérification JWT : %s", exc)
-        raise HTTPException(status_code=401, detail="Token invalide")
+        raise HTTPException(status_code=401, detail={
+            "error_code": ErrorCode.INVALID_TOKEN,
+            "message": get_error_message(ErrorCode.INVALID_TOKEN),
+        })

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.cities")
 
@@ -23,7 +24,10 @@ def set_supabase_service(service: SupabaseService):
 
 def _require_supabase():
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configure")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
     return _supabase_service.supabase_client
 
 
@@ -139,11 +143,17 @@ async def is_city_saved(
 async def get_city(city_id: str) -> Dict:
     """Recupere les details d'une city par son ID avec toutes ses relations."""
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configure")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
 
     city = await _supabase_service.get_city(city_id)
     if not city:
-        raise HTTPException(404, detail="City introuvable")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.CITY_NOT_FOUND,
+            "message": get_error_message(ErrorCode.CITY_NOT_FOUND),
+        })
 
     return city
 
@@ -165,7 +175,10 @@ async def delete_city(
         .execute()
 
     if not res.data:
-        raise HTTPException(404, detail="City introuvable ou acces refuse")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.CITY_NOT_FOUND,
+            "message": get_error_message(ErrorCode.CITY_NOT_FOUND),
+        })
 
     job_id = res.data.get("job_id")
 
@@ -244,7 +257,10 @@ async def merge_cities(
         .execute()
 
     if not target_res.data or not source_res.data:
-        raise HTTPException(404, detail="City introuvable ou acces refuse")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.CITY_NOT_FOUND,
+            "message": get_error_message(ErrorCode.CITY_NOT_FOUND),
+        })
 
     source_job_id = source_res.data.get("job_id")
 

@@ -4,15 +4,19 @@ FastAPI + Qwen2-VL-7B + yt-dlp + Server-Sent Events
 """
 import logging
 from contextlib import asynccontextmanager
+from typing import Union
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 
 from config import settings
 from services.ml_service import ml_service
 from services.supabase_service import SupabaseService
 from services.job_processor import JobProcessor
 from api import analyze, trips, inbox, profile, review, cities, city_review, notifications
+from models.errors import ErrorCode, ErrorResponse, get_error_message
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +77,38 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# ── Middleware de formatting des erreurs ───────────────────────────────────────
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: ValidationError):
+    details = []
+    for error in exc.errors():
+        details.append({
+            "code": ErrorCode.INVALID_REQUEST,
+            "message": error.get("msg", "Validation error"),
+            "field": ".".join(str(loc) for loc in error.get("loc", [])),
+        })
+    return JSONResponse(
+        status_code=422,
+        content=ErrorResponse(
+            error_code=ErrorCode.INVALID_REQUEST,
+            message="Validation error",
+            details=details,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error_code=ErrorCode.UNKNOWN_ERROR,
+            message=get_error_message(ErrorCode.UNKNOWN_ERROR),
+        ).model_dump(),
+    )
+
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 
