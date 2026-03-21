@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     )
 
     # ── Gemini API ────────────────────────────────────────────────────────────
-    GEMINI_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""            # Rétro-compat (clé unique)
+    GEMINI_API_KEYS: str = ""           # Clés multiples séparées par des virgules
     GEMINI_MODEL_ID: str = "gemini-2.0-flash"
 
     # ── Serveur ───────────────────────────────────────────────────────────────
@@ -28,6 +29,18 @@ class Settings(BaseSettings):
     # ── Supabase ──────────────────────────────────────────────────────────────
     supabase_url: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
+
+    @property
+    def gemini_api_key_list(self) -> list[str]:
+        """Retourne la liste des clés API Gemini disponibles."""
+        keys: list[str] = []
+        # Priorité aux clés multiples
+        if self.GEMINI_API_KEYS:
+            keys = [k.strip() for k in self.GEMINI_API_KEYS.split(",") if k.strip()]
+        # Fallback sur la clé unique (rétro-compat)
+        if not keys and self.GEMINI_API_KEY:
+            keys = [self.GEMINI_API_KEY]
+        return keys
 
 
 settings = Settings()

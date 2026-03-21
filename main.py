@@ -94,13 +94,17 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Vérification de l'état de santé de l'API"""
-    return {
+    response = {
         "status": "ok" if ml_service.is_ready() else "loading",
         "model": settings.GEMINI_MODEL_ID,
         "device": ml_service.device or "unknown",
         "model_loaded": ml_service.is_ready(),
         "supabase_connected": supabase_service.is_configured(),
     }
+    # Ajouter le statut du pool de clés si disponible
+    if ml_service._key_pool:
+        response["key_pool"] = ml_service._key_pool.status()
+    return response
 
 
 # Inclusion des routers

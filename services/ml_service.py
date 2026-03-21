@@ -1,12 +1,14 @@
 """
 services/ml_service.py — Analyse vidéo via Google Gemini API
-Remplace le modèle local Qwen2-VL.
+Utilise GeminiKeyPool pour la rotation automatique des clés.
 Interface publique identique : load_model / run_inference / is_ready / unload_model
 """
+from __future__ import annotations
+
 import json
 import logging
 import time
-from typing import Tuple, Dict, Optional
+from typing import TYPE_CHECKING, Tuple, Dict, Optional
 
 from utils.prompts import (
     TRAVEL_PROMPT,
@@ -16,111 +18,190 @@ from utils.prompts import (
     get_city_fallback_result,
 )
 
+if TYPE_CHECKING:
+    from services.gemini_key_pool import GeminiKeyPool
+
 logger = logging.getLogger("bombo.ml_service")
 
 
 class MLService:
-    """Wrapper Gemini API — même interface que l'ancien service Qwen2-VL."""
+    """Wrapper Gemini API avec rotation automatique des clés."""
 
-    def __init__(self):
-        self._client = None
+    def __init__(self) -> None:
+        self._key_pool: Optional[GeminiKeyPool] = None
         self._model_id: Optional[str] = None
         self.device: Optional[str] = "gemini-api"
 
     def load_model(self, **kwargs):
         """
-        Configure le client Gemini.
+        Configure le pool de clés Gemini.
         Les anciens paramètres (model_id, max_pixels, fps) sont ignorés si présents.
         La clé et le modèle sont lus depuis config.settings.
         """
         from config import settings
-        from google import genai
+        from services.gemini_key_pool import GeminiKeyPool
 
-        if not settings.GEMINI_API_KEY:
-            logger.warning("GEMINI_API_KEY non configurée — le service ne sera pas opérationnel.")
+        keys = settings.gemini_api_key_list
+        if not keys:
+            logger.warning("Aucune clé Gemini configurée — le service ne sera pas opérationnel.")
             return
 
-        self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self._key_pool = GeminiKeyPool(keys)
         self._model_id = settings.GEMINI_MODEL_ID
-        logger.info("Client Gemini initialisé — modèle : %s ✓", self._model_id)
+        logger.info(
+            "Client Gemini initialisé — modèle : %s, %d clé(s) dans le pool ✓",
+            self._model_id,
+            len(keys),
+        )
 
     def unload_model(self):
         """No-op : pas de modèle en mémoire à décharger."""
-        self._client = None
+        self._key_pool = None
         logger.info("Client Gemini libéré.")
 
     def is_ready(self) -> bool:
-        return self._client is not None and bool(self._model_id)
+        return self._key_pool is not None and bool(self._model_id)
+
+    def _call_gemini(self, contents: list, config_obj) -> str:
+        """
+        Appelle Gemini avec rotation automatique des clés.
+        En cas d'erreur 429 (quota), bascule sur la clé suivante et retry.
+        Retourne le texte brut de la réponse.
+        """
+        from services.gemini_key_pool import AllKeysExhaustedError
+
+        last_error = None
+
+        # On peut tenter autant de fois qu'il y a de clés
+        for attempt in range(self._key_pool.total_keys):
+            client, key_idx = self._key_pool.get_client()
+
+            try:
+                response = client.models.generate_content(
+                    model=self._model_id,
+                    contents=contents,
+                    config=config_obj,
+                )
+                return response.text or ""
+
+            except Exception as e:
+                error_str = str(e).lower()
+                # Détecter les erreurs de quota (429 / ResourceExhausted)
+                if "429" in error_str or "resource" in error_str and "exhausted" in error_str:
+                    logger.warning(
+                        "Clé #%d : quota atteint (tentative %d/%d) — %s",
+                        key_idx + 1,
+                        attempt + 1,
+                        self._key_pool.total_keys,
+                        e,
+                    )
+                    self._key_pool.mark_exhausted(key_idx)
+                    last_error = e
+                else:
+                    # Autre erreur (réseau, etc.) → ne pas consommer la clé
+                    raise
+
+        # Toutes les clés ont été essayées
+        raise AllKeysExhaustedError(
+            f"Toutes les {self._key_pool.total_keys} clé(s) sont épuisées. "
+            f"Dernière erreur : {last_error}"
+        )
+
+    def _upload_and_wait(self, client, video_path: str):
+        """Upload une vidéo vers Gemini File API et attend qu'elle soit ACTIVE."""
+        from google.genai import types
+
+        logger.info("Upload de la vidéo vers Gemini File API : %s", video_path)
+        uploaded_file = client.files.upload(
+            file=video_path,
+            config=types.UploadFileConfig(mime_type="video/mp4"),
+        )
+        logger.info("Fichier uploadé : %s (state=%s)", uploaded_file.name, uploaded_file.state)
+
+        # Attendre ACTIVE
+        max_wait = 120
+        waited = 0
+        while str(uploaded_file.state) not in ("FileState.ACTIVE", "ACTIVE"):
+            if waited >= max_wait:
+                raise RuntimeError("Timeout : le fichier Gemini n'est pas devenu ACTIVE.")
+            time.sleep(2)
+            waited += 2
+            uploaded_file = client.files.get(name=uploaded_file.name)
+            logger.debug("File state: %s (attendu depuis %ds)", uploaded_file.state, waited)
+
+        logger.info("Fichier ACTIVE après %ds — lancement de l'analyse.", waited)
+        return uploaded_file
 
     def run_inference(self, video_path: str, **kwargs) -> Tuple[Dict, float]:
         """
         Analyse une vidéo via Gemini et retourne (result_dict, durée_secondes).
-        Flux :
-          1. Upload fichier vidéo vers Gemini File API
-          2. Attendre que le fichier soit ACTIVE
-          3. Générer le contenu (JSON structuré)
-          4. Parser la réponse
-          5. Supprimer le fichier uploadé (cleanup)
+        Utilise la rotation de clés automatique.
         """
         if not self.is_ready():
             raise RuntimeError("Le client Gemini n'est pas initialisé.")
 
         from google.genai import types
+        from services.gemini_key_pool import AllKeysExhaustedError
 
         t0 = time.time()
         uploaded_file = None
+        client = None
 
-        try:
-            # ── Étape 1 : Upload ──────────────────────────────────────────────
-            logger.info("Upload de la vidéo vers Gemini File API : %s", video_path)
-            uploaded_file = self._client.files.upload(
-                file=video_path,
-                config=types.UploadFileConfig(mime_type="video/mp4"),
-            )
-            logger.info("Fichier uploadé : %s (state=%s)", uploaded_file.name, uploaded_file.state)
+        last_error = None
 
-            # ── Étape 2 : Attendre ACTIVE ─────────────────────────────────────
-            max_wait = 120  # secondes
-            waited = 0
-            while str(uploaded_file.state) not in ("FileState.ACTIVE", "ACTIVE"):
-                if waited >= max_wait:
-                    raise RuntimeError("Timeout : le fichier Gemini n'est pas devenu ACTIVE.")
-                time.sleep(2)
-                waited += 2
-                uploaded_file = self._client.files.get(name=uploaded_file.name)
-                logger.debug("File state: %s (attendu depuis %ds)", uploaded_file.state, waited)
+        for attempt in range(self._key_pool.total_keys):
+            client, key_idx = self._key_pool.get_client()
 
-            logger.info("Fichier ACTIVE après %ds — lancement de l'analyse.", waited)
+            try:
+                # ── Étape 1-2 : Upload + wait ─────────────────────────────────
+                uploaded_file = self._upload_and_wait(client, video_path)
 
-            # ── Étape 3 : Génération ──────────────────────────────────────────
-            t_gen = time.time()
-            response = self._client.models.generate_content(
-                model=self._model_id,
-                contents=[uploaded_file, TRAVEL_PROMPT],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            duration = round(time.time() - t_gen, 2)
-            logger.info("Génération terminée en %.2fs", duration)
+                # ── Étape 3 : Génération ──────────────────────────────────────
+                t_gen = time.time()
+                response = client.models.generate_content(
+                    model=self._model_id,
+                    contents=[uploaded_file, TRAVEL_PROMPT],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                duration = round(time.time() - t_gen, 2)
+                logger.info("Génération terminée en %.2fs", duration)
 
-            # ── Étape 4 : Parse ───────────────────────────────────────────────
-            raw_text = response.text or ""
-            logger.debug("Réponse brute (%d chars) : %s", len(raw_text), raw_text[:300])
-            result = self._parse_json(raw_text)
+                # ── Étape 4 : Parse ───────────────────────────────────────────
+                raw_text = response.text or ""
+                logger.debug("Réponse brute (%d chars) : %s", len(raw_text), raw_text[:300])
+                result = self._parse_json(raw_text)
 
-        finally:
-            # ── Étape 5 : Cleanup Gemini ──────────────────────────────────────
-            if uploaded_file:
-                try:
-                    self._client.files.delete(name=uploaded_file.name)
-                    logger.debug("Fichier Gemini supprimé : %s", uploaded_file.name)
-                except Exception as e:
-                    logger.warning("Impossible de supprimer le fichier Gemini : %s", e)
+                # ── Cleanup ───────────────────────────────────────────────────
+                self._cleanup_file(client, uploaded_file)
 
-        total_duration = round(time.time() - t0, 2)
-        return result, total_duration
+                total_duration = round(time.time() - t0, 2)
+                return result, total_duration
+
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or ("resource" in error_str and "exhausted" in error_str):
+                    logger.warning(
+                        "Clé #%d : quota atteint (tentative %d/%d)",
+                        key_idx + 1, attempt + 1, self._key_pool.total_keys,
+                    )
+                    self._key_pool.mark_exhausted(key_idx)
+                    # Cleanup le fichier uploadé avec la clé actuelle avant de retry
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                    last_error = e
+                else:
+                    # Autre erreur → cleanup et raise
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                    raise
+
+        raise AllKeysExhaustedError(
+            f"Toutes les {self._key_pool.total_keys} clé(s) épuisées. Dernière erreur : {last_error}"
+        )
 
     def run_inference_with_prompt(
         self,
@@ -132,66 +213,70 @@ class MLService:
         """
         Analyse une vidéo via Gemini avec un prompt personnalisé.
         Utilisé pour la détection du type de contenu et l'extraction city.
+        Utilise la rotation de clés automatique.
         """
         if not self.is_ready():
             raise RuntimeError("Le client Gemini n'est pas initialisé.")
 
         from google.genai import types
+        from services.gemini_key_pool import AllKeysExhaustedError
 
         t0 = time.time()
         uploaded_file = None
+        client = None
+        last_error = None
 
-        try:
-            # ── Étape 1 : Upload ──────────────────────────────────────────────
-            logger.info("Upload de la vidéo vers Gemini File API : %s", video_path)
-            uploaded_file = self._client.files.upload(
-                file=video_path,
-                config=types.UploadFileConfig(mime_type="video/mp4"),
-            )
-            logger.info("Fichier uploadé : %s (state=%s)", uploaded_file.name, uploaded_file.state)
+        for attempt in range(self._key_pool.total_keys):
+            client, key_idx = self._key_pool.get_client()
 
-            # ── Étape 2 : Attendre ACTIVE ─────────────────────────────────────
-            max_wait = 120  # secondes
-            waited = 0
-            while str(uploaded_file.state) not in ("FileState.ACTIVE", "ACTIVE"):
-                if waited >= max_wait:
-                    raise RuntimeError("Timeout : le fichier Gemini n'est pas devenu ACTIVE.")
-                time.sleep(2)
-                waited += 2
-                uploaded_file = self._client.files.get(name=uploaded_file.name)
-                logger.debug("File state: %s (attendu depuis %ds)", uploaded_file.state, waited)
+            try:
+                # ── Upload + wait ─────────────────────────────────────────────
+                uploaded_file = self._upload_and_wait(client, video_path)
 
-            logger.info("Fichier ACTIVE après %ds — lancement de l'analyse.", waited)
+                # ── Génération ────────────────────────────────────────────────
+                t_gen = time.time()
+                response = client.models.generate_content(
+                    model=self._model_id,
+                    contents=[uploaded_file, prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
+                )
+                duration = round(time.time() - t_gen, 2)
+                logger.info("Génération terminée en %.2fs", duration)
 
-            # ── Étape 3 : Génération ──────────────────────────────────────────
-            t_gen = time.time()
-            response = self._client.models.generate_content(
-                model=self._model_id,
-                contents=[uploaded_file, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            duration = round(time.time() - t_gen, 2)
-            logger.info("Génération terminée en %.2fs", duration)
+                # ── Parse ─────────────────────────────────────────────────────
+                raw_text = response.text or ""
+                logger.debug("Réponse brute (%d chars) : %s", len(raw_text), raw_text[:300])
+                result = self._parse_json_generic(raw_text, fallback_result)
 
-            # ── Étape 4 : Parse ───────────────────────────────────────────────
-            raw_text = response.text or ""
-            logger.debug("Réponse brute (%d chars) : %s", len(raw_text), raw_text[:300])
-            result = self._parse_json_generic(raw_text, fallback_result)
+                # ── Cleanup ───────────────────────────────────────────────────
+                self._cleanup_file(client, uploaded_file)
 
-        finally:
-            # ── Étape 5 : Cleanup Gemini ──────────────────────────────────────
-            if uploaded_file:
-                try:
-                    self._client.files.delete(name=uploaded_file.name)
-                    logger.debug("Fichier Gemini supprimé : %s", uploaded_file.name)
-                except Exception as e:
-                    logger.warning("Impossible de supprimer le fichier Gemini : %s", e)
+                total_duration = round(time.time() - t0, 2)
+                return result, total_duration
 
-        total_duration = round(time.time() - t0, 2)
-        return result, total_duration
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or ("resource" in error_str and "exhausted" in error_str):
+                    logger.warning(
+                        "Clé #%d : quota atteint (tentative %d/%d)",
+                        key_idx + 1, attempt + 1, self._key_pool.total_keys,
+                    )
+                    self._key_pool.mark_exhausted(key_idx)
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                    last_error = e
+                else:
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                    raise
+
+        raise AllKeysExhaustedError(
+            f"Toutes les {self._key_pool.total_keys} clé(s) épuisées. Dernière erreur : {last_error}"
+        )
 
     def detect_entity_type(self, video_path: str) -> str:
         """
@@ -219,6 +304,16 @@ class MLService:
             CITY_EXTRACTION_PROMPT,
             get_city_fallback_result(),
         )
+
+    @staticmethod
+    def _cleanup_file(client, uploaded_file):
+        """Supprime un fichier uploadé sur Gemini."""
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+                logger.debug("Fichier Gemini supprimé : %s", uploaded_file.name)
+            except Exception as e:
+                logger.warning("Impossible de supprimer le fichier Gemini : %s", e)
 
     def _parse_json_generic(self, raw_text: str, fallback_result: Dict) -> Dict:
         """Parse le JSON de la réponse Gemini avec fallback personnalisable."""
