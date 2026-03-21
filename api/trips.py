@@ -311,3 +311,48 @@ async def unsave_trip(
         .eq("user_id", user_id) \
         .eq("trip_id", trip_id) \
         .execute()
+
+
+@router.post("/{trip_id}/validate-and-save", status_code=200)
+async def validate_and_save_trip(
+    trip_id: str,
+    body: SaveTripBody = SaveTripBody(),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Valide et sauvegarde un trip de manière atomique (transactionnelle).
+
+    Cette opération combine syncDestinations + saveTrip en une seule transaction:
+    1. Supprime les spots des jours non-validés
+    2. Supprime les jours non-validés
+    3. Supprime les destinations orphelines
+    4. Met à jour days_spent
+    5. Recalcule visit_order
+    6. Sauvegarde le trip pour l'utilisateur
+
+    Si une étape échoue, toutes les modifications sont annulées (rollback).
+    """
+    sb = _require_supabase()
+
+    try:
+        # Appel de la fonction RPC PostgreSQL qui garantit l'atomicité
+        result = sb.rpc(
+            "validate_and_save_trip",
+            {
+                "p_trip_id": trip_id,
+                "p_user_id": user_id,
+                "p_notes": body.notes,
+            }
+        ).execute()
+
+        if result.data:
+            return result.data
+
+        return {"success": True, "synced": True, "saved": True}
+
+    except Exception as e:
+        logger.error(f"validate_and_save_trip failed for trip {trip_id}: {e}")
+        raise HTTPException(500, detail={
+            "error_code": ErrorCode.EXTERNAL_SERVICE_ERROR,
+            "message": f"Erreur lors de la validation du trip: {str(e)}",
+        })
