@@ -6,12 +6,13 @@ import asyncio
 import logging
 import tempfile
 import json
-from typing import Optional
+from typing import Dict, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 from models.schemas import AnalyzeUrlRequest
 from services.ml_service import ml_service
+from utils.url_normalizer import normalize_url
 from services.supabase_service import SupabaseService
 from services.sse_service import job_manager
 from services.notification_service import NotificationService
@@ -54,6 +55,55 @@ class JobProcessor:
             # Créer le job dans Supabase
             if self.supabase.is_configured():
                 await self.supabase.create_job(job_id, request.url, request.user_id)
+
+            # ── Étape 0.5 : Vérification de doublon ──────────────────────────
+            normalized_url: Optional[str] = None
+            if self.supabase.is_configured():
+                normalized_url = await normalize_url(request.url)
+                logger.info("[job %s] URL normalisée : %s", job_id, normalized_url)
+
+                existing = await self.supabase.find_trip_by_source_url(normalized_url)
+                if not existing:
+                    existing = await self.supabase.find_city_by_source_url(normalized_url)
+
+                if existing:
+                    entity_type = existing["type"]
+                    entity_id = existing["id"]
+                    logger.info("[job %s] Doublon trouvé : %s %s → clonage", job_id, entity_type, entity_id)
+
+                    if entity_type == "trip":
+                        new_id = await self.supabase.clone_trip_for_user(entity_id, job_id, request.user_id)
+                    else:
+                        new_id = await self.supabase.clone_city_for_user(entity_id, job_id, request.user_id)
+
+                    if new_id:
+                        response_data = {
+                            "job_id": job_id,
+                            "trip_id": new_id if entity_type == "trip" else None,
+                            "city_id": new_id if entity_type == "city" else None,
+                            "entity_type": entity_type,
+                            "duration_seconds": 0,
+                            "source_url": request.url,
+                            "cloned": True,
+                            "cloned_from": entity_id,
+                        }
+                        job_manager.update_job_status(job_id, "done", result=response_data)
+                        await job_manager.send_sse_update(
+                            job_id, "done", {"result": response_data, "progress": 100}
+                        )
+                        update_data: Dict = {
+                            "status": "done",
+                            "completed_at": datetime.utcnow().isoformat(),
+                            "duration_seconds": 0,
+                            "entity_type": entity_type,
+                        }
+                        if entity_type == "city":
+                            update_data["city_id"] = new_id
+                        await self.supabase.update_job(job_id, update_data)
+                        logger.info("[job %s] Cloné depuis %s %s ✓", job_id, entity_type, entity_id)
+                        return
+                    else:
+                        logger.warning("[job %s] Clonage échoué, flow classique", job_id)
 
             # ── Étape 1 : Téléchargement ─────────────────────────────────────
             await job_manager.send_sse_update(job_id, "downloading", {"progress": 0})
@@ -153,6 +203,8 @@ class JobProcessor:
                 )
                 # Ajouter l'URL source au résultat avant de sauvegarder
                 result["source_url"] = request.url
+                if normalized_url:
+                    result["normalized_source_url"] = normalized_url
 
                 if entity_type == 'city':
                     city_id = await self.supabase.create_city(

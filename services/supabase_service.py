@@ -163,6 +163,7 @@ class SupabaseService:
                 # à chaque INSERT/DELETE sur itinerary_days
                 "best_season": trip_data.get("best_season"),
                 "source_url": trip_data.get("source_url"),
+                "normalized_source_url": trip_data.get("normalized_source_url"),
                 "content_creator_handle": trip_data.get("content_creator", {}).get(
                     "handle"
                 ),
@@ -580,6 +581,7 @@ class SupabaseService:
                 "vibe_tags": city_data.get("vibe_tags", []),
                 "best_season": city_data.get("best_season"),
                 "source_url": city_data.get("source_url"),
+                "normalized_source_url": city_data.get("normalized_source_url"),
                 "content_creator_handle": city_data.get("content_creator", {}).get("handle"),
                 "content_creator_links": city_data.get("content_creator", {}).get("links_mentioned", []),
             }
@@ -688,3 +690,233 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Erreur récupération cities user {user_id}: {e}")
             return []
+
+    # =========================================================================
+    # DEDUPLICATION
+    # =========================================================================
+
+    async def find_trip_by_source_url(self, normalized_url: str) -> Optional[Dict]:
+        """Cherche un trip existant par normalized_source_url. Retourne {id, trip_title, type} ou None."""
+        if not self.is_configured():
+            return None
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    self._get_url("trips"),
+                    params={
+                        "normalized_source_url": f"eq.{normalized_url}",
+                        "limit": "1",
+                        "select": "id,trip_title",
+                    },
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                response.raise_for_status()
+                rows = response.json()
+                if rows:
+                    return {**rows[0], "type": "trip"}
+                return None
+        except Exception as e:
+            logger.error(f"Erreur find_trip_by_source_url: {e}")
+            return None
+
+    async def find_city_by_source_url(self, normalized_url: str) -> Optional[Dict]:
+        """Cherche une city existante par normalized_source_url. Retourne {id, city_title, type} ou None."""
+        if not self.is_configured():
+            return None
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    self._get_url("cities"),
+                    params={
+                        "normalized_source_url": f"eq.{normalized_url}",
+                        "limit": "1",
+                        "select": "id,city_title",
+                    },
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                response.raise_for_status()
+                rows = response.json()
+                if rows:
+                    return {**rows[0], "type": "city"}
+                return None
+        except Exception as e:
+            logger.error(f"Erreur find_city_by_source_url: {e}")
+            return None
+
+    async def clone_trip_for_user(
+        self, source_trip_id: str, job_id: str, user_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Clone un trip existant (avec toutes ses relations) pour un nouvel utilisateur. Retourne le nouvel ID."""
+        if not self.is_configured():
+            return None
+
+        def _do_clone() -> Optional[str]:
+            import httpx as _httpx
+
+            def _sb_get(table: str, params: dict) -> list:
+                r = _httpx.get(
+                    self._get_url(table),
+                    params={**params, "select": "*"},
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                r.raise_for_status()
+                return r.json()
+
+            def _sb_insert(table: str, payload: dict) -> dict:
+                r = _httpx.post(
+                    self._get_url(table),
+                    json=payload,
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if not r.is_success:
+                    logger.error("❌ %s → %s | body: %s", table, r.status_code, r.text)
+                r.raise_for_status()
+                rows = r.json()
+                return rows[0] if rows else {}
+
+            # 1. Fetch source trip
+            trips = _sb_get("trips", {"id": f"eq.{source_trip_id}"})
+            if not trips:
+                logger.error(f"Trip source {source_trip_id} introuvable")
+                return None
+            src = trips[0]
+
+            # 2. Create new trip (new id, new user, new job — same content)
+            SKIP = {"id", "created_at", "updated_at", "duration_days"}
+            new_trip_row = {k: v for k, v in src.items() if k not in SKIP}
+            new_trip_row["job_id"] = job_id
+            new_trip_row["user_id"] = user_id
+            new_trip = _sb_insert("trips", new_trip_row)
+            new_trip_id = new_trip["id"]
+            logger.info(f"Trip cloné: {source_trip_id} → {new_trip_id}")
+
+            # 3. Clone destinations (remap IDs pour les itinerary_days)
+            old_dest_to_new: dict = {}
+            for dest in _sb_get("destinations", {"trip_id": f"eq.{source_trip_id}"}):
+                old_id = dest["id"]
+                new_dest = {k: v for k, v in dest.items() if k not in SKIP}
+                new_dest["trip_id"] = new_trip_id
+                inserted = _sb_insert("destinations", new_dest)
+                old_dest_to_new[old_id] = inserted["id"]
+
+            # 4. Clone itinerary_days + spots
+            for day in _sb_get("itinerary_days", {"trip_id": f"eq.{source_trip_id}"}):
+                old_day_id = day["id"]
+                new_day = {k: v for k, v in day.items() if k not in SKIP}
+                new_day["trip_id"] = new_trip_id
+                old_dest_id = day.get("destination_id")
+                new_day["destination_id"] = old_dest_to_new.get(old_dest_id) if old_dest_id else None
+                inserted_day = _sb_insert("itinerary_days", new_day)
+                new_day_id = inserted_day["id"]
+
+                for spot in _sb_get("spots", {"itinerary_day_id": f"eq.{old_day_id}"}):
+                    new_spot = {k: v for k, v in spot.items() if k not in SKIP}
+                    new_spot["itinerary_day_id"] = new_day_id
+                    _sb_insert("spots", new_spot)
+
+            # 5. Clone logistics
+            for log in _sb_get("logistics", {"trip_id": f"eq.{source_trip_id}"}):
+                new_log = {k: v for k, v in log.items() if k not in SKIP}
+                new_log["trip_id"] = new_trip_id
+                _sb_insert("logistics", new_log)
+
+            # 6. Clone budget
+            for budget in _sb_get("budgets", {"trip_id": f"eq.{source_trip_id}"}):
+                new_budget = {k: v for k, v in budget.items() if k not in SKIP}
+                new_budget["trip_id"] = new_trip_id
+                _sb_insert("budgets", new_budget)
+
+            # 7. Clone practical_info
+            for practical in _sb_get("practical_info", {"trip_id": f"eq.{source_trip_id}"}):
+                new_practical = {k: v for k, v in practical.items() if k not in SKIP}
+                new_practical["trip_id"] = new_trip_id
+                _sb_insert("practical_info", new_practical)
+
+            logger.info(f"Trip {source_trip_id} cloné complètement → {new_trip_id} ✓")
+            return new_trip_id
+
+        try:
+            return await asyncio.to_thread(_do_clone)
+        except Exception as e:
+            logger.error(f"Erreur clonage trip {source_trip_id}: {e}")
+            return None
+
+    async def clone_city_for_user(
+        self, source_city_id: str, job_id: str, user_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Clone une city existante (avec tous ses highlights) pour un nouvel utilisateur. Retourne le nouvel ID."""
+        if not self.is_configured():
+            return None
+
+        def _do_clone() -> Optional[str]:
+            import httpx as _httpx
+
+            def _sb_get(table: str, params: dict) -> list:
+                r = _httpx.get(
+                    self._get_url(table),
+                    params={**params, "select": "*"},
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                r.raise_for_status()
+                return r.json()
+
+            def _sb_insert(table: str, payload: dict) -> dict:
+                r = _httpx.post(
+                    self._get_url(table),
+                    json=payload,
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if not r.is_success:
+                    logger.error("❌ %s → %s | body: %s", table, r.status_code, r.text)
+                r.raise_for_status()
+                rows = r.json()
+                return rows[0] if rows else {}
+
+            # 1. Fetch source city
+            cities = _sb_get("cities", {"id": f"eq.{source_city_id}"})
+            if not cities:
+                logger.error(f"City source {source_city_id} introuvable")
+                return None
+            src = cities[0]
+
+            # 2. Create new city
+            SKIP = {"id", "created_at", "updated_at"}
+            new_city_row = {k: v for k, v in src.items() if k not in SKIP}
+            new_city_row["job_id"] = job_id
+            new_city_row["user_id"] = user_id
+            new_city = _sb_insert("cities", new_city_row)
+            new_city_id = new_city["id"]
+            logger.info(f"City clonée: {source_city_id} → {new_city_id}")
+
+            # 3. Clone highlights
+            for h in _sb_get("city_highlights", {"city_id": f"eq.{source_city_id}"}):
+                new_h = {k: v for k, v in h.items() if k not in SKIP}
+                new_h["city_id"] = new_city_id
+                _sb_insert("city_highlights", new_h)
+
+            # 4. Clone budget
+            for budget in _sb_get("city_budgets", {"city_id": f"eq.{source_city_id}"}):
+                new_budget = {k: v for k, v in budget.items() if k not in SKIP}
+                new_budget["city_id"] = new_city_id
+                _sb_insert("city_budgets", new_budget)
+
+            # 5. Clone practical_info
+            for practical in _sb_get("city_practical_info", {"city_id": f"eq.{source_city_id}"}):
+                new_practical = {k: v for k, v in practical.items() if k not in SKIP}
+                new_practical["city_id"] = new_city_id
+                _sb_insert("city_practical_info", new_practical)
+
+            logger.info(f"City {source_city_id} clonée complètement → {new_city_id} ✓")
+            return new_city_id
+
+        try:
+            return await asyncio.to_thread(_do_clone)
+        except Exception as e:
+            logger.error(f"Erreur clonage city {source_city_id}: {e}")
+            return None
