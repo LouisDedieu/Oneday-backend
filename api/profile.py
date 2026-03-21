@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.profile")
 router = APIRouter(prefix="/profile", tags=["profile"])
@@ -50,7 +51,10 @@ class ProfileResponse(BaseModel):
 async def get_profile(user_id: str = Depends(get_current_user_id)) -> ProfileResponse:
     """Retourne le profil et les statistiques de l'utilisateur connecté."""
     if not _supabase_service or not _supabase_service.supabase_client:
-        raise HTTPException(503, detail="Supabase non configuré")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
 
     sb = _supabase_service.supabase_client
 

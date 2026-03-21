@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.trips")
 
@@ -24,7 +25,10 @@ def set_supabase_service(service: SupabaseService):
 
 def _require_supabase():
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configuré")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
     return _supabase_service.supabase_client
 
 
@@ -238,11 +242,17 @@ async def is_trip_saved(
 async def get_trip(trip_id: str) -> Dict:
     """Récupère les détails d'un voyage par son ID."""
     if not _supabase_service or not _supabase_service.is_configured():
-        raise HTTPException(503, detail="Supabase non configuré")
+        raise HTTPException(503, detail={
+            "error_code": ErrorCode.SERVICE_UNAVAILABLE,
+            "message": get_error_message(ErrorCode.SERVICE_UNAVAILABLE),
+        })
 
     trip = await _supabase_service.get_trip(trip_id)
     if not trip:
-        raise HTTPException(404, detail="Voyage introuvable")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.TRIP_NOT_FOUND,
+            "message": get_error_message(ErrorCode.TRIP_NOT_FOUND),
+        })
 
     return trip
 
@@ -257,7 +267,10 @@ async def delete_trip(
     # Vérifier ownership et récupérer job_id
     res = sb.from_("trips").select("id, job_id").eq("id", trip_id).eq("user_id", user_id).maybe_single().execute()
     if not res.data:
-        raise HTTPException(404, detail="Trip introuvable ou accès refusé")
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.TRIP_NOT_FOUND,
+            "message": get_error_message(ErrorCode.TRIP_NOT_FOUND),
+        })
 
     job_id = res.data.get("job_id")
 
@@ -298,3 +311,48 @@ async def unsave_trip(
         .eq("user_id", user_id) \
         .eq("trip_id", trip_id) \
         .execute()
+
+
+@router.post("/{trip_id}/validate-and-save", status_code=200)
+async def validate_and_save_trip(
+    trip_id: str,
+    body: SaveTripBody = SaveTripBody(),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Valide et sauvegarde un trip de manière atomique (transactionnelle).
+
+    Cette opération combine syncDestinations + saveTrip en une seule transaction:
+    1. Supprime les spots des jours non-validés
+    2. Supprime les jours non-validés
+    3. Supprime les destinations orphelines
+    4. Met à jour days_spent
+    5. Recalcule visit_order
+    6. Sauvegarde le trip pour l'utilisateur
+
+    Si une étape échoue, toutes les modifications sont annulées (rollback).
+    """
+    sb = _require_supabase()
+
+    try:
+        # Appel de la fonction RPC PostgreSQL qui garantit l'atomicité
+        result = sb.rpc(
+            "validate_and_save_trip",
+            {
+                "p_trip_id": trip_id,
+                "p_user_id": user_id,
+                "p_notes": body.notes,
+            }
+        ).execute()
+
+        if result.data:
+            return result.data
+
+        return {"success": True, "synced": True, "saved": True}
+
+    except Exception as e:
+        logger.error(f"validate_and_save_trip failed for trip {trip_id}: {e}")
+        raise HTTPException(500, detail={
+            "error_code": ErrorCode.EXTERNAL_SERVICE_ERROR,
+            "message": f"Erreur lors de la validation du trip: {str(e)}",
+        })
