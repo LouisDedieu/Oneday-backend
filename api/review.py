@@ -4,11 +4,13 @@ api/review.py — Endpoints du mode review (validation d'itinéraire)
 import logging
 import asyncio
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from services.geocoding_service import batch_geocode_spots, batch_geocode_destinations
+from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.review")
 router = APIRouter(prefix="/review", tags=["review"])
@@ -28,34 +30,170 @@ def _require_supabase():
 
 
 def _check_day_ownership(sb, day_id: str, user_id: str) -> None:
-    res = sb.from_("itinerary_days") \
-        .select("id, trips(user_id)") \
-        .eq("id", day_id) \
-        .maybe_single() \
-        .execute()
-    if not res.data or (res.data.get("trips") or {}).get("user_id") != user_id:
-        raise HTTPException(404, detail="Jour introuvable")
+    """
+    Vérifie que le jour existe et appartient à un trip de l'utilisateur.
+    Utilise 2 requêtes séparées pour éviter les problèmes de jointure Supabase.
+    """
+    try:
+        # 1. Récupérer le jour et son trip_id
+        day_res = sb.from_("itinerary_days") \
+            .select("id, trip_id") \
+            .eq("id", day_id) \
+            .maybe_single() \
+            .execute()
+
+        if not day_res or not day_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DAY_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DAY_NOT_FOUND),
+            })
+
+        trip_id = day_res.data.get("trip_id")
+        if not trip_id:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DAY_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DAY_NOT_FOUND),
+            })
+
+        # 2. Vérifier que le trip appartient à l'utilisateur
+        trip_res = sb.from_("trips") \
+            .select("id") \
+            .eq("id", trip_id) \
+            .eq("user_id", user_id) \
+            .maybe_single() \
+            .execute()
+
+        if not trip_res or not trip_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DAY_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DAY_NOT_FOUND),
+            })
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.DAY_NOT_FOUND,
+            "message": get_error_message(ErrorCode.DAY_NOT_FOUND),
+        })
 
 
 def _check_spot_ownership(sb, spot_id: str, user_id: str) -> None:
-    res = sb.from_("spots") \
-        .select("id, itinerary_days(trips(user_id))") \
-        .eq("id", spot_id) \
-        .maybe_single() \
-        .execute()
-    days = (res.data.get("itinerary_days") or {}) if res.data else {}
-    if not res.data or (days.get("trips") or {}).get("user_id") != user_id:
-        raise HTTPException(404, detail="Spot introuvable")
+    """
+    Vérifie que le spot existe et appartient à un trip de l'utilisateur.
+    Utilise 3 requêtes séparées pour éviter les problèmes de jointure Supabase.
+    """
+    try:
+        # 1. Récupérer le spot et son itinerary_day_id
+        spot_res = sb.from_("spots") \
+            .select("id, itinerary_day_id") \
+            .eq("id", spot_id) \
+            .maybe_single() \
+            .execute()
+
+        if not spot_res or not spot_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.SPOT_NOT_FOUND,
+                "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+            })
+
+        day_id = spot_res.data.get("itinerary_day_id")
+        if not day_id:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.SPOT_NOT_FOUND,
+                "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+            })
+
+        # 2. Récupérer le jour et son trip_id
+        day_res = sb.from_("itinerary_days") \
+            .select("id, trip_id") \
+            .eq("id", day_id) \
+            .maybe_single() \
+            .execute()
+
+        if not day_res or not day_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.SPOT_NOT_FOUND,
+                "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+            })
+
+        trip_id = day_res.data.get("trip_id")
+        if not trip_id:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.SPOT_NOT_FOUND,
+                "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+            })
+
+        # 3. Vérifier que le trip appartient à l'utilisateur
+        trip_res = sb.from_("trips") \
+            .select("id") \
+            .eq("id", trip_id) \
+            .eq("user_id", user_id) \
+            .maybe_single() \
+            .execute()
+
+        if not trip_res or not trip_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.SPOT_NOT_FOUND,
+                "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+            })
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.SPOT_NOT_FOUND,
+            "message": get_error_message(ErrorCode.SPOT_NOT_FOUND),
+        })
 
 
 def _check_destination_ownership(sb, dest_id: str, user_id: str) -> None:
-    res = sb.from_("destinations") \
-        .select("id, trips(user_id)") \
-        .eq("id", dest_id) \
-        .maybe_single() \
-        .execute()
-    if not res.data or (res.data.get("trips") or {}).get("user_id") != user_id:
-        raise HTTPException(404, detail="Destination introuvable")
+    """
+    Vérifie que la destination existe et appartient à un trip de l'utilisateur.
+    Utilise 2 requêtes séparées pour éviter les problèmes de jointure Supabase.
+    """
+    try:
+        # 1. Récupérer la destination et son trip_id
+        dest_res = sb.from_("destinations") \
+            .select("id, trip_id") \
+            .eq("id", dest_id) \
+            .maybe_single() \
+            .execute()
+
+        if not dest_res or not dest_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DESTINATION_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DESTINATION_NOT_FOUND),
+            })
+
+        trip_id = dest_res.data.get("trip_id")
+        if not trip_id:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DESTINATION_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DESTINATION_NOT_FOUND),
+            })
+
+        # 2. Vérifier que le trip appartient à l'utilisateur
+        trip_res = sb.from_("trips") \
+            .select("id") \
+            .eq("id", trip_id) \
+            .eq("user_id", user_id) \
+            .maybe_single() \
+            .execute()
+
+        if not trip_res or not trip_res.data:
+            raise HTTPException(404, detail={
+                "error_code": ErrorCode.DESTINATION_NOT_FOUND,
+                "message": get_error_message(ErrorCode.DESTINATION_NOT_FOUND),
+            })
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(404, detail={
+            "error_code": ErrorCode.DESTINATION_NOT_FOUND,
+            "message": get_error_message(ErrorCode.DESTINATION_NOT_FOUND),
+        })
 
 
 # ── Modèles ───────────────────────────────────────────────────────────────────
@@ -223,9 +361,94 @@ async def validate_day(
     return {"updated": True}
 
 
+async def _geocode_review_in_background(trip_id: str) -> None:
+    """
+    Background task to geocode all spots and destinations for a trip.
+    This runs AFTER the sync is complete, so it doesn't block the UI.
+    """
+    if not _supabase_service or not _supabase_service.is_configured():
+        logger.warning("Supabase not configured for background geocoding")
+        return
+
+    sb = _supabase_service.supabase_client
+    geocoded_spots = 0
+    geocoded_destinations = 0
+
+    try:
+        # Récupérer les jours validés avec leur location et coordonnées
+        days_res = sb.from_("itinerary_days") \
+            .select("id, location, latitude, longitude") \
+            .eq("trip_id", trip_id) \
+            .eq("validated", True) \
+            .execute()
+        valid_days = days_res.data or []
+
+        if not valid_days:
+            logger.info(f"No valid days found for trip {trip_id}, skipping geocoding")
+            return
+
+        valid_day_ids = [d["id"] for d in valid_days]
+        day_location_map = {d["id"]: d.get("location") for d in valid_days}
+
+        # 1. Geocoder les destinations (jours) sans coordonnées
+        async def update_day_coords(day_id: str, lat: float, lon: float):
+            await asyncio.to_thread(
+                lambda: sb.from_("itinerary_days")
+                    .update({"latitude": lat, "longitude": lon})
+                    .eq("id", day_id)
+                    .execute()
+            )
+
+        dest_results = await batch_geocode_destinations(
+            destinations=valid_days,
+            update_callback=update_day_coords,
+        )
+        geocoded_destinations = len(dest_results)
+
+        # 2. Récupérer et geocoder les spots sans coordonnées
+        spots_res = sb.from_("spots") \
+            .select("id, name, address, latitude, longitude, itinerary_day_id") \
+            .in_("itinerary_day_id", valid_day_ids) \
+            .execute()
+        all_spots = spots_res.data or []
+
+        async def update_spot_coords(spot_id: str, lat: float, lon: float):
+            await asyncio.to_thread(
+                lambda: sb.from_("spots")
+                    .update({"latitude": lat, "longitude": lon})
+                    .eq("id", spot_id)
+                    .execute()
+            )
+
+        # Grouper les spots par location et geocoder
+        spots_by_location: Dict[str, List] = {}
+        for spot in all_spots:
+            day_id = spot.get("itinerary_day_id")
+            location = day_location_map.get(day_id)
+            if location:
+                spots_by_location.setdefault(location, []).append(spot)
+
+        for location, spots in spots_by_location.items():
+            results = await batch_geocode_spots(
+                spots=spots,
+                location=location,
+                update_callback=update_spot_coords,
+            )
+            geocoded_spots += len(results)
+
+        logger.info(
+            f"Background geocoding complete for trip {trip_id}: "
+            f"{geocoded_destinations} destinations, {geocoded_spots} spots"
+        )
+
+    except Exception as e:
+        logger.error(f"Background geocoding failed for trip {trip_id}: {e}")
+
+
 @router.post("/{trip_id}/sync", status_code=200)
 async def sync_destinations(
     trip_id: str,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
 ) -> Dict:
     """
@@ -235,18 +458,23 @@ async def sync_destinations(
     3. Supprime destinations orphelines
     4. Met à jour days_spent
     5. Recalcule visit_order séquentiel
+    6. (Background) Geocode les spots et destinations sans coordonnées
+
+    Le geocoding se fait en arrière-plan après la synchronisation.
     """
     sb = _require_supabase()
 
-    # 1. Charger tous les jours du trip
-    days_res = sb.from_("itinerary_days") \
-        .select("id, destination_id, validated") \
-        .eq("trip_id", trip_id) \
-        .execute()
+    # 1. Charger tous les jours du trip avec leur location
+    days_res = await asyncio.to_thread(
+        lambda: sb.from_("itinerary_days")
+            .select("id, destination_id, validated, location")
+            .eq("trip_id", trip_id)
+            .execute()
+    )
 
     all_days = days_res.data or []
     if not all_days:
-        return {"synced": True}
+        return {"synced": True, "geocoding_scheduled": False}
 
     invalid_days = [d for d in all_days if not d.get("validated", True)]
     valid_days   = [d for d in all_days if  d.get("validated", True)]
@@ -254,19 +482,27 @@ async def sync_destinations(
     # 2. Supprimer spots + jours non-validés
     if invalid_days:
         invalid_ids = [d["id"] for d in invalid_days]
-        sb.from_("spots").delete().in_("itinerary_day_id", invalid_ids).execute()
-        sb.from_("itinerary_days").delete().in_("id", invalid_ids).execute()
+        await asyncio.to_thread(
+            lambda: sb.from_("spots").delete().in_("itinerary_day_id", invalid_ids).execute()
+        )
+        await asyncio.to_thread(
+            lambda: sb.from_("itinerary_days").delete().in_("id", invalid_ids).execute()
+        )
 
     # 3. Destinations encore référencées
     active_dest_ids = {d["destination_id"] for d in valid_days if d.get("destination_id")}
 
     # 4. Supprimer destinations orphelines
-    dests_res = sb.from_("destinations").select("id").eq("trip_id", trip_id).execute()
+    dests_res = await asyncio.to_thread(
+        lambda: sb.from_("destinations").select("id").eq("trip_id", trip_id).execute()
+    )
     all_dest_ids = [d["id"] for d in (dests_res.data or [])]
     orphan_ids = [did for did in all_dest_ids if did not in active_dest_ids]
 
     if orphan_ids:
-        sb.from_("destinations").delete().in_("id", orphan_ids).execute()
+        await asyncio.to_thread(
+            lambda: sb.from_("destinations").delete().in_("id", orphan_ids).execute()
+        )
 
     # 5. Mettre à jour days_spent
     days_by_dest: Dict[str, int] = {}
@@ -276,20 +512,35 @@ async def sync_destinations(
             days_by_dest[dest_id] = days_by_dest.get(dest_id, 0) + 1
 
     for dest_id, count in days_by_dest.items():
-        sb.from_("destinations").update({"days_spent": count}).eq("id", dest_id).execute()
+        await asyncio.to_thread(
+            lambda did=dest_id, c=count: sb.from_("destinations")
+                .update({"days_spent": c})
+                .eq("id", did)
+                .execute()
+        )
 
     # 6. Recalculer visit_order
-    remaining_res = sb.from_("destinations") \
-        .select("id, visit_order") \
-        .eq("trip_id", trip_id) \
-        .order("visit_order") \
-        .execute()
+    remaining_res = await asyncio.to_thread(
+        lambda: sb.from_("destinations")
+            .select("id, visit_order")
+            .eq("trip_id", trip_id)
+            .order("visit_order")
+            .execute()
+    )
 
     remaining = remaining_res.data or []
     for i, dest in enumerate(remaining):
-        sb.from_("destinations").update({"visit_order": i + 1}).eq("id", dest["id"]).execute()
+        await asyncio.to_thread(
+            lambda did=dest["id"], order=i+1: sb.from_("destinations")
+                .update({"visit_order": order})
+                .eq("id", did)
+                .execute()
+        )
 
-    return {"synced": True}
+    # 7. Lancer le geocoding en arrière-plan (non-bloquant)
+    background_tasks.add_task(_geocode_review_in_background, trip_id)
+
+    return {"synced": True, "geocoding_scheduled": True}
 
 
 @router.patch("/spots/{spot_id}", status_code=200)

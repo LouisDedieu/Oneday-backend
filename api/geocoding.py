@@ -83,6 +83,9 @@ async def geocode_search(
 
             return GeocodingResponse(results=results)
 
+    except HTTPException:
+        # Re-raise FastAPI exceptions (429, etc.)
+        raise
     except httpx.TimeoutException:
         logger.warning("Geocoding request timed out for query: %s", q)
         raise HTTPException(

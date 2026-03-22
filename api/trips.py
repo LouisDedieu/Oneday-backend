@@ -2,13 +2,15 @@
 Routes pour la gestion des trips (voyages)
 """
 import logging
+import asyncio
 from typing import List, Dict, Optional
 from collections import defaultdict
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel
 
 from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
+from services.geocoding_service import batch_geocode_spots, batch_geocode_destinations
 from models.errors import ErrorCode, get_error_message
 
 logger = logging.getLogger("bombo.api.trips")
@@ -313,9 +315,94 @@ async def unsave_trip(
         .execute()
 
 
+async def _geocode_trip_in_background(trip_id: str) -> None:
+    """
+    Background task to geocode all spots and destinations for a trip.
+    This runs AFTER the trip has been saved, so it doesn't block the UI.
+    """
+    if not _supabase_service or not _supabase_service.is_configured():
+        logger.warning("Supabase not configured for background geocoding")
+        return
+
+    sb = _supabase_service.supabase_client
+    geocoded_spots = 0
+    geocoded_destinations = 0
+
+    try:
+        # Récupérer les jours validés avec leur location et coordonnées
+        days_res = sb.from_("itinerary_days") \
+            .select("id, location, latitude, longitude") \
+            .eq("trip_id", trip_id) \
+            .eq("validated", True) \
+            .execute()
+        valid_days = days_res.data or []
+
+        if not valid_days:
+            logger.info(f"No valid days found for trip {trip_id}, skipping geocoding")
+            return
+
+        valid_day_ids = [d["id"] for d in valid_days]
+        day_location_map = {d["id"]: d.get("location") for d in valid_days}
+
+        # 1. Geocoder les destinations (jours) sans coordonnées
+        async def update_day_coords(day_id: str, lat: float, lon: float):
+            await asyncio.to_thread(
+                lambda: sb.from_("itinerary_days")
+                    .update({"latitude": lat, "longitude": lon})
+                    .eq("id", day_id)
+                    .execute()
+            )
+
+        dest_results = await batch_geocode_destinations(
+            destinations=valid_days,
+            update_callback=update_day_coords,
+        )
+        geocoded_destinations = len(dest_results)
+
+        # 2. Récupérer et geocoder les spots sans coordonnées
+        spots_res = sb.from_("spots") \
+            .select("id, name, address, latitude, longitude, itinerary_day_id") \
+            .in_("itinerary_day_id", valid_day_ids) \
+            .execute()
+        all_spots = spots_res.data or []
+
+        async def update_spot_coords(spot_id: str, lat: float, lon: float):
+            await asyncio.to_thread(
+                lambda: sb.from_("spots")
+                    .update({"latitude": lat, "longitude": lon})
+                    .eq("id", spot_id)
+                    .execute()
+            )
+
+        # Grouper les spots par location et geocoder
+        spots_by_location: Dict[str, List] = {}
+        for spot in all_spots:
+            day_id = spot.get("itinerary_day_id")
+            location = day_location_map.get(day_id)
+            if location:
+                spots_by_location.setdefault(location, []).append(spot)
+
+        for location, spots in spots_by_location.items():
+            results = await batch_geocode_spots(
+                spots=spots,
+                location=location,
+                update_callback=update_spot_coords,
+            )
+            geocoded_spots += len(results)
+
+        logger.info(
+            f"Background geocoding complete for trip {trip_id}: "
+            f"{geocoded_destinations} destinations, {geocoded_spots} spots"
+        )
+
+    except Exception as e:
+        logger.error(f"Background geocoding failed for trip {trip_id}: {e}")
+
+
 @router.post("/{trip_id}/validate-and-save", status_code=200)
 async def validate_and_save_trip(
     trip_id: str,
+    background_tasks: BackgroundTasks,
     body: SaveTripBody = SaveTripBody(),
     user_id: str = Depends(get_current_user_id),
 ) -> Dict:
@@ -329,8 +416,10 @@ async def validate_and_save_trip(
     4. Met à jour days_spent
     5. Recalcule visit_order
     6. Sauvegarde le trip pour l'utilisateur
+    7. (Background) Geocode les spots et destinations sans coordonnées
 
     Si une étape échoue, toutes les modifications sont annulées (rollback).
+    Le geocoding se fait en arrière-plan après la sauvegarde.
     """
     sb = _require_supabase()
 
@@ -345,10 +434,16 @@ async def validate_and_save_trip(
             }
         ).execute()
 
-        if result.data:
-            return result.data
+        # Lancer le geocoding en arrière-plan (non-bloquant)
+        background_tasks.add_task(_geocode_trip_in_background, trip_id)
 
-        return {"success": True, "synced": True, "saved": True}
+        if result.data:
+            response = result.data
+            if isinstance(response, dict):
+                response["geocoding_scheduled"] = True
+            return response
+
+        return {"success": True, "synced": True, "saved": True, "geocoding_scheduled": True}
 
     except Exception as e:
         logger.error(f"validate_and_save_trip failed for trip {trip_id}: {e}")

@@ -17,6 +17,8 @@ class ErrorCode(str, Enum):
     TRIP_NOT_FOUND = "TRIP_NOT_FOUND"
     CITY_NOT_FOUND = "CITY_NOT_FOUND"
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
+    DAY_NOT_FOUND = "DAY_NOT_FOUND"
+    SPOT_NOT_FOUND = "SPOT_NOT_FOUND"
     HIGHLIGHT_NOT_FOUND = "HIGHLIGHT_NOT_FOUND"
     DESTINATION_NOT_FOUND = "DESTINATION_NOT_FOUND"
 
@@ -56,6 +58,8 @@ ERROR_MESSAGES = {
     ErrorCode.TRIP_NOT_FOUND: "Voyage introuvable",
     ErrorCode.CITY_NOT_FOUND: "Ville introuvable",
     ErrorCode.JOB_NOT_FOUND: "Job introuvable",
+    ErrorCode.DAY_NOT_FOUND: "Jour introuvable",
+    ErrorCode.SPOT_NOT_FOUND: "Spot introuvable",
     ErrorCode.HIGHLIGHT_NOT_FOUND: "Highlight introuvable",
     ErrorCode.DESTINATION_NOT_FOUND: "Destination introuvable",
     ErrorCode.ACCESS_DENIED: "Accès refusé",
