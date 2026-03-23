@@ -9,6 +9,7 @@ class ErrorCode(str, Enum):
     PRIVATE_VIDEO = "PRIVATE_VIDEO"
     IP_BLOCKED = "IP_BLOCKED"
     DOWNLOAD_ERROR = "DOWNLOAD_ERROR"
+    VIDEO_TOO_LONG = "VIDEO_TOO_LONG"
     INFERENCE_ERROR = "INFERENCE_ERROR"
     MODEL_NOT_LOADED = "MODEL_NOT_LOADED"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
@@ -52,6 +53,7 @@ ERROR_MESSAGES = {
     ErrorCode.PRIVATE_VIDEO: "La vidéo est privée ou n'est plus disponible",
     ErrorCode.IP_BLOCKED: "Accès temporairement bloqué, réessayez plus tard",
     ErrorCode.DOWNLOAD_ERROR: "Impossible de télécharger la vidéo",
+    ErrorCode.VIDEO_TOO_LONG: "Cette vidéo dépasse la durée maximale de 5 minutes",
     ErrorCode.INFERENCE_ERROR: "Erreur lors de l'analyse de la vidéo",
     ErrorCode.MODEL_NOT_LOADED: "Le modèle n'est pas encore chargé",
     ErrorCode.SERVICE_UNAVAILABLE: "Le service n'est pas disponible",

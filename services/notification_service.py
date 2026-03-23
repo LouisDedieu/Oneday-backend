@@ -354,5 +354,7 @@ class NotificationService:
             return ErrorCode.DOWNLOAD_ERROR.value
         if "inférence" in error_msg_lower or "inference" in error_msg_lower:
             return ErrorCode.INFERENCE_ERROR.value
+        if "trop longue" in error_msg_lower or "too long" in error_msg_lower:
+            return ErrorCode.VIDEO_TOO_LONG.value
 
         return ErrorCode.UNKNOWN_ERROR.value

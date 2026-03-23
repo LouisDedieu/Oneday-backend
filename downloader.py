@@ -51,6 +51,7 @@ SUPPORTED_DOMAINS = {
 URL_RE = re.compile(r"https?://(?P<domain>[^/\s]+)", re.IGNORECASE)
 
 DOWNLOAD_TIMEOUT = 120  # secondes
+MAX_VIDEO_DURATION = 300  # 5 minutes en secondes
 
 # Cibles d'impersonation curl_cffi
 _CHROME = ImpersonateTarget("chrome", "124")
@@ -90,6 +91,9 @@ class IPBlockedError(PermissionError):
 
 class DownloadError(RuntimeError):
     """Échec générique du téléchargement."""
+
+class VideoTooLongError(ValueError):
+    """La vidéo dépasse la durée maximale autorisée."""
 
 
 # ── Stratégies ────────────────────────────────────────────────────────────────
@@ -279,6 +283,14 @@ def _download_sync(
                 "✓ Téléchargé : '%s' (durée=%ss)",
                 info.get("title", "?"), info.get("duration", "?"),
             )
+
+            video_duration = info.get("duration")
+            if video_duration and video_duration > MAX_VIDEO_DURATION:
+                raise VideoTooLongError(
+                    f"La vidéo dure {video_duration // 60}min {video_duration % 60}s "
+                    f"(max: {MAX_VIDEO_DURATION // 60}min)"
+                )
+
             return  # succès
 
         except yt_dlp.utils.DownloadError as exc:

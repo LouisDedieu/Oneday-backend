@@ -22,6 +22,7 @@ from downloader import (
     PrivateVideoError,
     IPBlockedError,
     DownloadError,
+    VideoTooLongError,
 )
 
 logger = logging.getLogger("bombo.job_processor")
@@ -127,6 +128,9 @@ class JobProcessor:
             except UnsupportedURLError:
                 error_msg = "URL non supportée (accepte TikTok, Instagram Reels)."
                 await self._handle_error(job_id, error_msg, request.user_id, request.url)
+                return
+            except VideoTooLongError as exc:
+                await self._handle_video_too_long_error(job_id, str(exc), request.user_id, request.url)
                 return
             except (PrivateVideoError, IPBlockedError, DownloadError) as exc:
                 await self._handle_error(job_id, str(exc), request.user_id, request.url)
@@ -308,6 +312,21 @@ class JobProcessor:
                 )
             except Exception as notif_exc:
                 logger.warning("[job %s] Erreur notification erreur: %s", job_id, notif_exc)
+
+    async def _handle_video_too_long_error(
+        self,
+        job_id: str,
+        error_msg: str,
+        user_id: Optional[str] = None,
+        source_url: Optional[str] = None,
+    ) -> None:
+        """Gère les erreurs de vidéo trop longue"""
+        job_manager.update_job_status(job_id, "error", error=error_msg)
+        await job_manager.send_sse_update(job_id, "error", {"error": error_msg, "video_too_long": True})
+        if self.supabase.is_configured():
+            await self.supabase.update_job(
+                job_id, {"status": "error", "error_message": error_msg}
+            )
 
     def shutdown(self):
         """Arrête le processeur de jobs"""
