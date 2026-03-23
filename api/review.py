@@ -1,5 +1,6 @@
 """
-api/review.py — Endpoints du mode review (validation d'itinéraire)
+api/review.py — Endpoints CRUD pour trips (spots, destinations, days)
+Anciennement sous /review, maintenant sous /trips pour cohérence
 """
 import logging
 import asyncio
@@ -11,9 +12,10 @@ from utils.auth import get_current_user_id
 from services.supabase_service import SupabaseService
 from services.geocoding_service import batch_geocode_spots, batch_geocode_destinations
 from models.errors import ErrorCode, get_error_message
+from models.spot_types import validate_spot_type
 
-logger = logging.getLogger("bombo.api.review")
-router = APIRouter(prefix="/review", tags=["review"])
+logger = logging.getLogger("bombo.api.trips_crud")
+router = APIRouter(prefix="/trips", tags=["trips"])
 
 _supabase_service: Optional[SupabaseService] = None
 
@@ -239,13 +241,46 @@ class ReorderDestinationsBody(BaseModel):
     destinations: List[DestinationOrderItem]
 
 
+class CreateSpotBody(BaseModel):
+    day_id: str
+    name: str
+    spot_type: Optional[str] = None
+    address: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    price_range: Optional[str] = None
+    tips: Optional[str] = None
+    highlight: bool = False
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+class SpotOrderItem(BaseModel):
+    id: str
+    order: int
+
+
+class ReorderSpotsBody(BaseModel):
+    spots: List[SpotOrderItem]
+
+
+class MoveSpotBody(BaseModel):
+    target_day_id: str
+    order: Optional[int] = None
+
+
+class UpdateDestinationBody(BaseModel):
+    city_name: Optional[str] = None
+    country: Optional[str] = None
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@router.get("/{trip_id}")
-async def get_trip_for_review(trip_id: str) -> Dict:
+@router.get("/{trip_id}/edit")
+async def get_trip_for_edit(trip_id: str) -> Dict:
     """
-    Retourne le trip complet pour le mode review :
-    trip + première destination + jours + spots (triés par spot_order).
+    Retourne le trip complet pour l'édition :
+    trip + destinations + jours + spots (triés par spot_order).
+    Inclut tous les jours (validés ou non) pour permettre l'édition.
     """
     sb = _require_supabase()
 
@@ -638,8 +673,8 @@ async def add_city_to_trip(
         .execute()
 
     highlights = highlights_res.data or []
-    if not highlights:
-        raise HTTPException(400, detail="Cette city n'a pas de highlights")
+    # Note: On permet d'ajouter une city vide (sans highlights)
+    # Un jour sera créé mais sans spots
 
     # 3. Déterminer le jour cible
     target_day_id = body.day_id
@@ -1056,3 +1091,239 @@ async def reorder_destinations(
     except Exception as e:
         logger.error(f"Error reordering destinations for trip {trip_id}: {e}")
         raise HTTPException(500, detail=f"Erreur lors du réordonnancement: {str(e)}")
+
+
+@router.post("/{trip_id}/spots", status_code=201)
+async def create_spot(
+    trip_id: str,
+    body: CreateSpotBody,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Crée un nouveau spot dans un jour d'itinéraire.
+    """
+    sb = _require_supabase()
+
+    # 1. Vérifier que le jour appartient au trip de l'utilisateur
+    _check_day_ownership(sb, body.day_id, user_id)
+
+    # 2. Vérifier que le jour appartient bien au trip spécifié
+    day_res = await asyncio.to_thread(
+        lambda: sb.from_("itinerary_days")
+            .select("id, trip_id")
+            .eq("id", body.day_id)
+            .maybe_single()
+            .execute()
+    )
+    if not day_res.data or day_res.data.get("trip_id") != trip_id:
+        raise HTTPException(400, detail="Le jour ne fait pas partie de ce trip")
+
+    # 3. Calculer le prochain spot_order
+    max_order_res = await asyncio.to_thread(
+        lambda: sb.from_("spots")
+            .select("spot_order")
+            .eq("itinerary_day_id", body.day_id)
+            .order("spot_order", desc=True)
+            .limit(1)
+            .execute()
+    )
+    max_order = 0
+    if max_order_res.data and len(max_order_res.data) > 0:
+        max_order = max_order_res.data[0].get("spot_order") or 0
+
+    # 4. Créer le spot
+    # Validate spot_type using shared constants
+    spot_type = validate_spot_type(body.spot_type)
+
+    spot_data = {
+        "itinerary_day_id": body.day_id,
+        "name": body.name,
+        "spot_type": spot_type,
+        "address": body.address,
+        "duration_minutes": body.duration_minutes,
+        "price_range": body.price_range,
+        "tips": body.tips,
+        "highlight": body.highlight,
+        "spot_order": max_order + 1,
+    }
+    if body.latitude is not None:
+        spot_data["latitude"] = body.latitude
+    if body.longitude is not None:
+        spot_data["longitude"] = body.longitude
+
+    new_spot_res = await asyncio.to_thread(
+        lambda: sb.from_("spots").insert(spot_data).execute()
+    )
+    if not new_spot_res.data:
+        raise HTTPException(500, detail="Erreur lors de la création du spot")
+
+    new_spot = new_spot_res.data[0]
+    return {
+        "id": new_spot["id"],
+        "name": new_spot["name"],
+        "day_id": new_spot["itinerary_day_id"],
+        "spot": new_spot,  # Full spot object for convenience
+    }
+
+
+@router.patch("/days/{day_id}/spots/reorder", status_code=200)
+async def reorder_spots(
+    day_id: str,
+    body: ReorderSpotsBody,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Met à jour l'ordre des spots dans un jour d'itinéraire.
+    """
+    sb = _require_supabase()
+
+    # 1. Vérifier l'ownership du jour
+    _check_day_ownership(sb, day_id, user_id)
+
+    # 2. Vérifier que tous les spots appartiennent à ce jour
+    spot_ids = [s.id for s in body.spots]
+    if spot_ids:
+        check_res = await asyncio.to_thread(
+            lambda: sb.from_("spots")
+                .select("id")
+                .eq("itinerary_day_id", day_id)
+                .in_("id", spot_ids)
+                .execute()
+        )
+        found_ids = {s["id"] for s in (check_res.data or [])}
+        missing = set(spot_ids) - found_ids
+        if missing:
+            raise HTTPException(404, detail=f"Spots introuvables dans ce jour: {missing}")
+
+    # 3. Mettre à jour spot_order pour chaque spot
+    for spot in body.spots:
+        await asyncio.to_thread(
+            lambda s=spot: sb.from_("spots")
+                .update({"spot_order": s.order})
+                .eq("id", s.id)
+                .execute()
+        )
+
+    return {"reordered": True}
+
+
+@router.patch("/spots/{spot_id}/move", status_code=200)
+async def move_spot(
+    spot_id: str,
+    body: MoveSpotBody,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Déplace un spot vers un autre jour d'itinéraire.
+    """
+    sb = _require_supabase()
+
+    # 1. Vérifier l'ownership du spot
+    _check_spot_ownership(sb, spot_id, user_id)
+
+    # 2. Vérifier que le jour cible appartient aussi à l'utilisateur
+    _check_day_ownership(sb, body.target_day_id, user_id)
+
+    # 3. Vérifier que le spot et le jour cible appartiennent au même trip
+    spot_res = await asyncio.to_thread(
+        lambda: sb.from_("spots")
+            .select("id, itinerary_day_id")
+            .eq("id", spot_id)
+            .maybe_single()
+            .execute()
+    )
+    if not spot_res.data:
+        raise HTTPException(404, detail="Spot introuvable")
+
+    current_day_id = spot_res.data.get("itinerary_day_id")
+
+    # Récupérer le trip_id des deux jours
+    days_res = await asyncio.to_thread(
+        lambda: sb.from_("itinerary_days")
+            .select("id, trip_id")
+            .in_("id", [current_day_id, body.target_day_id])
+            .execute()
+    )
+    days_by_id = {d["id"]: d for d in (days_res.data or [])}
+
+    current_day = days_by_id.get(current_day_id)
+    target_day = days_by_id.get(body.target_day_id)
+
+    if not current_day or not target_day:
+        raise HTTPException(404, detail="Jour introuvable")
+
+    if current_day.get("trip_id") != target_day.get("trip_id"):
+        raise HTTPException(400, detail="Le jour cible doit faire partie du même trip")
+
+    # 4. Calculer le nouvel ordre si non spécifié
+    new_order = body.order
+    if new_order is None:
+        max_order_res = await asyncio.to_thread(
+            lambda: sb.from_("spots")
+                .select("spot_order")
+                .eq("itinerary_day_id", body.target_day_id)
+                .order("spot_order", desc=True)
+                .limit(1)
+                .execute()
+        )
+        max_order = 0
+        if max_order_res.data and len(max_order_res.data) > 0:
+            max_order = max_order_res.data[0].get("spot_order") or 0
+        new_order = max_order + 1
+
+    # 5. Déplacer le spot
+    await asyncio.to_thread(
+        lambda: sb.from_("spots")
+            .update({
+                "itinerary_day_id": body.target_day_id,
+                "spot_order": new_order,
+            })
+            .eq("id", spot_id)
+            .execute()
+    )
+
+    return {"moved": True}
+
+
+@router.patch("/destinations/{dest_id}", status_code=200)
+async def update_destination(
+    dest_id: str,
+    body: UpdateDestinationBody,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict:
+    """
+    Met à jour le nom de ville et/ou le pays d'une destination.
+    """
+    sb = _require_supabase()
+
+    # 1. Vérifier l'ownership de la destination
+    _check_destination_ownership(sb, dest_id, user_id)
+
+    # 2. Construire le payload de mise à jour
+    payload = {}
+    if body.city_name is not None:
+        payload["city"] = body.city_name.strip()
+    if body.country is not None:
+        payload["country"] = body.country.strip() if body.country else None
+
+    if not payload:
+        return {"updated": False}
+
+    # 3. Mettre à jour la destination
+    await asyncio.to_thread(
+        lambda: sb.from_("destinations")
+            .update(payload)
+            .eq("id", dest_id)
+            .execute()
+    )
+
+    # 4. Si le nom de la ville a changé, mettre à jour aussi le location des jours liés
+    if body.city_name is not None:
+        await asyncio.to_thread(
+            lambda: sb.from_("itinerary_days")
+                .update({"location": body.city_name.strip()})
+                .eq("destination_id", dest_id)
+                .execute()
+        )
+
+    return {"updated": True}

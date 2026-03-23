@@ -1,5 +1,6 @@
 """
-api/city_review.py — Endpoints du mode review pour les cities
+api/city_review.py — Endpoints CRUD pour cities (highlights)
+Anciennement sous /review/city, maintenant sous /cities pour cohérence
 """
 import logging
 import asyncio
@@ -12,8 +13,8 @@ from services.supabase_service import SupabaseService
 from services.geocoding_service import batch_geocode_highlights
 from models.errors import ErrorCode, get_error_message
 
-logger = logging.getLogger("bombo.api.city_review")
-router = APIRouter(prefix="/review/city", tags=["city_review"])
+logger = logging.getLogger("bombo.api.cities_crud")
+router = APIRouter(prefix="/cities", tags=["cities"])
 
 _supabase_service: Optional[SupabaseService] = None
 
@@ -139,11 +140,11 @@ class CreateHighlightBody(BaseModel):
 
 # -- Routes --------------------------------------------------------------------
 
-@router.get("/{city_id}")
-async def get_city_for_review(city_id: str) -> Dict:
+@router.get("/{city_id}/edit")
+async def get_city_for_edit(city_id: str) -> Dict:
     """
-    Retourne la city complete pour le mode review :
-    city + tous les highlights (valides et non-valides).
+    Retourne la city complète pour l'édition :
+    city + tous les highlights (validés et non-validés).
     """
     sb = _require_supabase()
 
@@ -174,12 +175,12 @@ async def get_city_for_review(city_id: str) -> Dict:
         asyncio.to_thread(fetch_budget),
     )
 
-    if not city_res.data:
+    if not city_res or not city_res.data:
         raise HTTPException(404, detail="City introuvable")
 
     city = city_res.data
-    highlights = highlights_res.data or []
-    budget = budget_res.data
+    highlights = highlights_res.data if highlights_res else []
+    budget = budget_res.data if budget_res else None
 
     # Formater les highlights
     formatted_highlights = [
