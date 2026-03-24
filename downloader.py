@@ -108,6 +108,50 @@ def _detect_content_type(info: dict) -> ContentType:
     return ContentType.VIDEO
 
 
+def _extract_carousel_image_urls(info: dict) -> list[dict]:
+    """
+    Extrait les URLs des images depuis les métadonnées yt-dlp.
+    Cherche dans plusieurs emplacements possibles.
+    """
+    image_urls = []
+    image_extensions = {'jpg', 'jpeg', 'png', 'webp'}
+    
+    entries = info.get('entries', [])
+    for entry in entries:
+        if not entry:
+            continue
+        url = entry.get('url') or entry.get('thumbnail')
+        ext = entry.get('ext', '').lower()
+        if url and ext in image_extensions:
+            image_urls.append({'url': url, 'ext': ext})
+    
+    resources = info.get('resources', [])
+    for resource in resources:
+        if resource.get('type') == 'image':
+            url = resource.get('url')
+            ext = resource.get('ext', 'jpg').lower()
+            if url and ext in image_extensions:
+                image_urls.append({'url': url, 'ext': ext})
+    
+    sidecar_list = info.get('side_data', {}).get('sidecar_thumbnails', [])
+    for thumb in sidecar_list:
+        url = thumb.get('url')
+        if url:
+            image_urls.append({'url': url, 'ext': 'jpg'})
+    
+    if info.get('media_type') == 8:
+        thumbnails = info.get('thumbnails', [])
+        display_resources = info.get('display_resources', [])
+        
+        for thumb in thumbnails + display_resources:
+            if isinstance(thumb, dict):
+                url = thumb.get('url') or thumb.get('src')
+                if url:
+                    image_urls.append({'url': url, 'ext': 'jpg'})
+    
+    return image_urls
+
+
 def _download_carousel_images(
     info: dict,
     output_dir: str,
@@ -120,32 +164,32 @@ def _download_carousel_images(
     os.makedirs(output_dir, exist_ok=True)
     file_paths: list[str] = []
     
-    entries = info.get('entries', [])
-    for idx, entry in enumerate(entries[:max_images]):
-        if not entry:
+    image_sources = _extract_carousel_image_urls(info)
+    
+    logger.info(f"URLs d'images extraites : {len(image_sources)}")
+    
+    for idx, source in enumerate(image_sources[:max_images]):
+        url = source.get('url')
+        ext = source.get('ext', 'jpg').lower()
+        
+        if not url:
             continue
         
-        ext = entry.get('ext', 'jpg').lower()
-        if ext not in {'jpg', 'jpeg', 'png', 'webp'}:
-            continue
-            
         output_path = os.path.join(output_dir, f"image_{idx:03d}.{ext}")
         
-        if entry.get('filepath') and os.path.exists(entry['filepath']):
-            shutil.copy(entry['filepath'], output_path)
-        elif entry.get('url'):
-            import httpx
-            try:
-                response = httpx.get(entry['url'], timeout=30)
-                response.raise_for_status()
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-            except Exception as e:
-                logger.warning(f"Échec téléchargement image {idx}: {e}")
-                continue
-        
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            file_paths.append(output_path)
+        import httpx
+        try:
+            response = httpx.get(url, timeout=30, follow_redirects=True)
+            response.raise_for_status()
+            with open(output_path, 'wb') as f:
+                f.write(response.content)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                file_paths.append(output_path)
+                logger.info(f"Image {idx+1} téléchargée : {os.path.getsize(output_path)} octets")
+        except Exception as e:
+            logger.warning(f"Échec téléchargement image {idx}: {e}")
+            continue
     
     return file_paths, len(file_paths)
 
