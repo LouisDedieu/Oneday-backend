@@ -622,17 +622,11 @@ def _download_with_info(
     
     for i, strategy in enumerate(strategies, start=1):
         try:
-            opts = strategy.build_ydl_opts(output_path)
-            opts['skip_download'] = True
-            opts['dump_single_json'] = True
-            opts['no_warnings'] = True
-            opts['quiet'] = True
-            opts['nocheckcertificate'] = True
-            
-            cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', '--no-check-certificate']
+            cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', 
+                   '--socket-timeout', '30', '-q']
             
             if strategy.impersonate:
-                cmd.append(f'--impersonate={strategy.impersonate}')
+                cmd.extend(['--impersonate', str(strategy.impersonate)])
             if strategy.cookies_from_browser:
                 cmd.extend(['--cookies-from-browser', strategy.cookies_from_browser])
             if strategy.cookies_file:
@@ -642,24 +636,35 @@ def _download_with_info(
             
             cmd.append(url)
             
+            logger.debug(f"Tentative {i}: {' '.join(cmd[:8])}...")
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=30,
             )
             
             if result.returncode == 0 and result.stdout:
-                info = json.loads(result.stdout.strip().split('\n')[-1])
-                logger.info(f"Métadonnées récupérées (tentative {i})")
-                return info, True
-            elif result.stderr:
-                logger.debug(f"Tentative {i} stderr: {result.stderr[:200]}")
+                lines = result.stdout.strip().split('\n')
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line and line.startswith('{'):
+                        try:
+                            info = json.loads(line)
+                            logger.info(f"Métadonnées récupérées (tentative {i}), type: {info.get('_type')}, entries: {len(info.get('entries', []))}")
+                            return info, True
+                        except json.JSONDecodeError:
+                            continue
+                logger.warning(f"Tentative {i}: stdout sans JSON valide")
+            else:
+                stderr = (result.stderr or '').strip()[:300]
+                logger.debug(f"Tentative {i} failed: {stderr}")
                 
         except subprocess.TimeoutExpired:
-            logger.debug(f"Tentative {i} timeout")
+            logger.warning(f"Tentative {i} timeout après 30s")
         except Exception as e:
-            logger.debug(f"Tentative {i} exception: {e}")
+            logger.warning(f"Tentative {i} exception: {e}")
         continue
     
     return {}, False
