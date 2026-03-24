@@ -617,13 +617,20 @@ def _download_with_info(
     import json
     import subprocess
     
+    logger.info(f"_download_with_info called with URL: {url}")
+    
     has_curl = _curl_cffi_available()
+    logger.info(f"has_curl: {has_curl}")
+    
     strategies = _build_strategies(cookies_file, proxy, has_curl)
+    logger.info(f"Nombre de stratégies: {len(strategies)}")
     
     for i, strategy in enumerate(strategies, start=1):
+        logger.info(f"Exécution stratégie {i}/{len(strategies)}: {strategy.label}")
+        
         try:
             cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', 
-                   '--socket-timeout', '30', '-q']
+                   '--socket-timeout', '30']
             
             if strategy.impersonate:
                 cmd.extend(['--impersonate', str(strategy.impersonate)])
@@ -636,7 +643,7 @@ def _download_with_info(
             
             cmd.append(url)
             
-            logger.debug(f"Tentative {i}: {' '.join(cmd[:8])}...")
+            logger.info(f"Commande: {cmd[:6]}...")
             
             result = subprocess.run(
                 cmd,
@@ -645,6 +652,8 @@ def _download_with_info(
                 timeout=30,
             )
             
+            logger.info(f"Stratégie {i} returncode: {result.returncode}")
+            
             if result.returncode == 0 and result.stdout:
                 lines = result.stdout.strip().split('\n')
                 for line in reversed(lines):
@@ -652,14 +661,15 @@ def _download_with_info(
                     if line and line.startswith('{'):
                         try:
                             info = json.loads(line)
-                            logger.info(f"Métadonnées récupérées (tentative {i}), type: {info.get('_type')}, entries: {len(info.get('entries', []))}")
+                            logger.info(f"JSON parsed successfully, _type: {info.get('_type')}, entries count: {len(info.get('entries', []))}")
                             return info, True
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"JSON parse error: {e}")
                             continue
                 logger.warning(f"Tentative {i}: stdout sans JSON valide")
             else:
-                stderr = (result.stderr or '').strip()[:300]
-                logger.debug(f"Tentative {i} failed: {stderr}")
+                stderr = (result.stderr or '').strip()[:500]
+                logger.warning(f"Tentative {i} failed with returncode {result.returncode}: {stderr[:200]}")
                 
         except subprocess.TimeoutExpired:
             logger.warning(f"Tentative {i} timeout après 30s")
@@ -667,6 +677,7 @@ def _download_with_info(
             logger.warning(f"Tentative {i} exception: {e}")
         continue
     
+    logger.warning("Toutes les stratégies ont échoué, retour {}, False")
     return {}, False
 
 
