@@ -330,6 +330,307 @@ def _download_carousel_instaloader(url: str, output_dir: str) -> tuple[list[str]
         return [], 0
 
 
+def _download_instagram_gallery_dl(url: str, output_dir: str) -> tuple[list[str], int]:
+    """
+    Télécharge les images d'un post Instagram (photo ou carrousel) via gallery-dl.
+    Retourne (file_paths, image_count).
+    """
+    import subprocess
+    
+    os.makedirs(output_dir, exist_ok=True)
+    file_paths: list[str] = []
+    
+    shortcode = None
+    
+    patterns = [
+        r'/p/([A-Za-z0-9_-]+)',
+        r'/reel/([A-Za-z0-9_-]+)',
+        r'/reels/([A-Za-z0-9_-]+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            shortcode = match.group(1)
+            break
+    
+    if not shortcode:
+        logger.warning(f"Impossible d'extraire le shortcode de l'URL: {url}")
+        return [], 0
+    
+    logger.info(f"Téléchargement Instagram via gallery-dl : {shortcode}")
+    
+    try:
+        result = subprocess.run(
+            [
+                "gallery-dl",
+                "-q",
+                "--cookies-from-browser", "chrome",
+                "-D", output_dir,
+                url
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            logger.warning(f"gallery-dl Instagram a échoué: {stderr}")
+            return [], 0
+        
+        downloaded = [f for f in os.listdir(output_dir) if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+        downloaded.sort()
+        
+        for f in downloaded:
+            full_path = os.path.join(output_dir, f)
+            if os.path.getsize(full_path) > 0:
+                file_paths.append(full_path)
+                logger.info(f"Image téléchargée : {f}")
+        
+        if not file_paths:
+            logger.warning("gallery-dl n'a pas téléchargé d'images")
+            return [], 0
+        
+        logger.info(f"gallery-dl a téléchargé {len(file_paths)} image(s)")
+        return file_paths, len(file_paths)
+        
+    except FileNotFoundError:
+        logger.warning("gallery-dl non installé, retour liste vide")
+        return [], 0
+    except Exception as e:
+        logger.warning(f"Échec gallery-dl Instagram: {e}")
+        return [], 0
+
+
+def _download_tiktok_carousel_yt_dlp(url: str, output_dir: str) -> tuple[list[str], int]:
+    """
+    Fallback: télécharge les images d'un carrousel TikTok via yt-dlp.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    file_paths: list[str] = []
+    
+    try:
+        import yt_dlp
+        
+        ydl_opts = {
+            'skip_download': False,
+            'format': 'jpg/png/webp',
+            'outtmpl': os.path.join(output_dir, 'image_%(autonumber)03d.%(ext)s'),
+            'quiet': True,
+            'no_warnings': False,
+            'logger': _YtdlpLogger(),
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+            if not info:
+                return [], 0
+            
+            formats = info.get('formats', [])
+            image_formats = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') == 'none']
+            
+            if not image_formats:
+                logger.warning("Pas de formats image trouvés pour ce carrousel")
+                return [], 0
+            
+            for f in sorted(os.listdir(output_dir)):
+                if f.startswith('image_') and f.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    full_path = os.path.join(output_dir, f)
+                    if os.path.getsize(full_path) > 0:
+                        file_paths.append(full_path)
+        
+        return file_paths, len(file_paths)
+        
+    except Exception as e:
+        logger.warning(f"Échec yt-dlp pour carrousel TikTok: {e}")
+        return [], 0
+
+
+def _resolve_tiktok_url(url: str) -> str | None:
+    """
+    Résout une URL TikTok courte (vm.tiktok.com) vers l'URL finale.
+    Retourne l'URL finale ou None si échec.
+    """
+    import httpx
+    
+    if 'vm.tiktok.com' not in url.lower():
+        return url
+    
+    try:
+        response = httpx.head(url, timeout=10, follow_redirects=True, allow_redirects=True)
+        final_url = str(response.url)
+        logger.info(f"URL résolue : {url} → {final_url}")
+        return final_url
+    except Exception as e:
+        logger.warning(f"Échec résolution URL TikTok: {e}")
+        try:
+            response = httpx.get(url, timeout=10, follow_redirects=True, allow_redirects=True)
+            final_url = str(response.url)
+            logger.info(f"URL résolue (GET): {url} → {final_url}")
+            return final_url
+        except Exception as e2:
+            logger.warning(f"Échec résolution URL TikTok (GET): {e2}")
+            return None
+
+
+def _download_tiktok_carousel(url: str, output_dir: str) -> tuple[list[str], int]:
+    """
+    Télécharge les images d'un carrousel TikTok.
+    Retourne (file_paths, image_count).
+    """
+    import httpx
+    
+    os.makedirs(output_dir, exist_ok=True)
+    file_paths: list[str] = []
+    
+    resolved_url = _resolve_tiktok_url(url)
+    if not resolved_url:
+        logger.warning("Impossible de résoudre l'URL TikTok")
+        return [], 0
+    
+    photo_id = None
+    
+    photo_match = re.search(r'photo/(\d+)', resolved_url)
+    if photo_match:
+        photo_id = photo_match.group(1)
+        logger.info(f"Photo ID extrait : {photo_id}")
+    
+    if not photo_id:
+        logger.warning(f"Impossible d'extraire le photo ID de l'URL résolue: {resolved_url}")
+        return [], 0
+    
+    logger.info(f"Téléchargement carrousel TikTok : {photo_id}")
+    
+    try:
+        import subprocess
+        
+        result = subprocess.run(
+            [
+                "gallery-dl",
+                "-q",
+                "--cookies-from-browser", "chrome",
+                "-D", output_dir,
+                resolved_url or url
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            logger.warning(f"gallery-dl a échoué: {stderr}")
+            if "unsupported url" in stderr.lower():
+                logger.info("URL non supportée par gallery-dl, tentative avec yt-dlp...")
+                return _download_tiktok_carousel_yt_dlp(resolved_url or url, output_dir)
+            return [], 0
+        
+        downloaded = [f for f in os.listdir(output_dir) if f.endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+        downloaded.sort()
+        
+        for f in downloaded:
+            full_path = os.path.join(output_dir, f)
+            if os.path.getsize(full_path) > 0:
+                file_paths.append(full_path)
+                logger.info(f"Image téléchargée : {f}")
+        
+        if not file_paths:
+            logger.warning("gallery-dl n'a pas téléchargé d'images")
+            return [], 0
+        
+        return file_paths, len(file_paths)
+        
+    except FileNotFoundError:
+        logger.warning("gallery-dl non installé. Installez avec: pip install gallery-dl")
+        return _download_tiktok_carousel_yt_dlp(resolved_url or url, output_dir)
+    except Exception as e:
+        logger.warning(f"Échec téléchargement carrousel TikTok: {e}")
+        return [], 0
+
+
+def create_composite_image(image_paths: list[str], output_path: str, max_size: int = 1024) -> str | None:
+    """
+    Fusionne plusieurs images en une grille pour réduire les appels API.
+    
+    Args:
+        image_paths: Liste des chemins des images à fusionner
+        output_path: Chemin de sortie pour l'image composite
+        max_size: Taille maximale de chaque image dans la grille (défaut: 1024px)
+    
+    Returns:
+        Chemin de l'image composite ou None si échec
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow non installé, impossible de créer une image composite")
+        return None
+    
+    if not image_paths:
+        return None
+    
+    images = []
+    for path in image_paths:
+        try:
+            img = Image.open(path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            images.append(img)
+        except Exception as e:
+            logger.warning(f"Impossible de charger {path}: {e}")
+            continue
+    
+    if not images:
+        return None
+    
+    n = len(images)
+    
+    if n == 1:
+        images[0].save(output_path)
+        return output_path
+    
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+    
+    thumb_w = max_size
+    thumb_h = max_size
+    spacing = 8
+    
+    total_w = cols * thumb_w + (cols + 1) * spacing
+    total_h = rows * thumb_h + (rows + 1) * spacing
+    
+    composite = Image.new('RGB', (total_w, total_h), (20, 20, 40))
+    
+    for idx, img in enumerate(images):
+        row = idx // cols
+        col = idx % cols
+        x = spacing + col * (thumb_w + spacing)
+        y = spacing + row * (thumb_h + spacing)
+        
+        img_w, img_h = img.size
+        scale = min(thumb_w / img_w, thumb_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        
+        img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        paste_x = x + (thumb_w - new_w) // 2
+        paste_y = y + (thumb_h - new_h) // 2
+        
+        composite.paste(img_resized, (paste_x, paste_y))
+    
+    composite.save(output_path, 'JPEG', quality=85)
+    logger.info(f"Image composite créée : {output_path} ({len(images)} images, {total_w}x{total_h})")
+    
+    for img in images:
+        img.close()
+    
+    return output_path
+
+
 # ── Stratégies ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -720,12 +1021,43 @@ async def download_content(
     video_path = os.path.join(output_dir, "video.mp4")
     os.makedirs(output_dir, exist_ok=True)
     
+    is_tiktok_photo = "/photo/" in validated_url.lower() and "tiktok.com" in validated_url.lower()
+    
+    if is_tiktok_photo:
+        logger.info("Détection URL photo TikTok,的直接 carrousel...")
+        loop = asyncio.get_running_loop()
+        file_paths, image_count = await loop.run_in_executor(
+            None,
+            partial(_download_tiktok_carousel, validated_url, output_dir)
+        )
+        
+        if file_paths:
+            return DownloadResult(
+                content_type=ContentType.CAROUSEL,
+                file_paths=file_paths,
+                duration_seconds=0.0,
+                image_count=image_count,
+            )
+        raise DownloadError("Impossible de télécharger le carrousel TikTok.")
+    
     video_downloaded = False
     try:
         await download_video(validated_url, video_path, cookies_file, proxy)
         video_downloaded = True
     except DownloadError as e:
-        if "vide ou introuvable" not in str(e).lower():
+        error_msg = str(e).lower()
+        logger.info("download_video a levé DownloadError: %s", e)
+        
+        is_empty_or_missing = "vide ou introuvable" in error_msg
+        is_unsupported = "unsupported url" in error_msg
+        is_photo_url = "/photo/" in validated_url.lower()
+        
+        if is_unsupported and is_photo_url:
+            logger.info("URL photo non supportée par yt-dlp, tentative carrousel...")
+        elif is_empty_or_missing:
+            logger.info("Fichier vidéo vide ou inexistant, tentative carrousel...")
+        else:
+            logger.warning("Erreur inattendue, on propage: %s", e)
             raise
     
     if video_downloaded and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
@@ -744,22 +1076,51 @@ async def download_content(
             image_count=0,
         )
     
-    logger.info("Fichier vidéo vide ou inexistant → tentative carrousel via instaloader")
+    is_tiktok = "tiktok.com" in validated_url.lower()
+    is_instagram_photo = "/p/" in validated_url.lower() and "instagram.com" in validated_url.lower()
+    is_instagram_reel = ("/reel/" in validated_url.lower() or "/reels/" in validated_url.lower()) and "instagram.com" in validated_url.lower()
     
-    file_paths, image_count = await loop.run_in_executor(
-        None,
-        partial(_download_carousel_instaloader, validated_url, output_dir)
-    )
-    
-    if file_paths:
-        return DownloadResult(
-            content_type=ContentType.CAROUSEL,
-            file_paths=file_paths,
-            duration_seconds=0.0,
-            image_count=image_count,
+    if is_tiktok:
+        logger.info("Vidéo vide → tentative carrousel TikTok")
+        file_paths, image_count = await loop.run_in_executor(
+            None,
+            partial(_download_tiktok_carousel, validated_url, output_dir)
         )
+        
+        if file_paths:
+            return DownloadResult(
+                content_type=ContentType.CAROUSEL,
+                file_paths=file_paths,
+                duration_seconds=0.0,
+                image_count=image_count,
+            )
+    
+    if is_instagram_photo:
+        logger.info("Détection post photo/carrousel Instagram → gallery-dl")
+        file_paths, image_count = await loop.run_in_executor(
+            None,
+            partial(_download_instagram_gallery_dl, validated_url, output_dir)
+        )
+        
+        if not file_paths:
+            logger.info("gallery-dl a échoué → tentative instaloader")
+            file_paths, image_count = await loop.run_in_executor(
+                None,
+                partial(_download_carousel_instaloader, validated_url, output_dir)
+            )
+        
+        if file_paths:
+            return DownloadResult(
+                content_type=ContentType.CAROUSEL,
+                file_paths=file_paths,
+                duration_seconds=0.0,
+                image_count=image_count,
+            )
+    
+    if is_instagram_reel:
+        logger.info("Détection Reel Instagram → yt-dlp")
     
     raise DownloadError(
         "Impossible de télécharger ce contenu. "
-        "Assurez-vous que le lien est public et que instaloader est installé."
+        "Assurez-vous que le lien est public."
     )
