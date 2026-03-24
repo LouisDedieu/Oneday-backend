@@ -654,19 +654,21 @@ def _download_with_info(
             
             logger.info(f"Stratégie {i} returncode: {result.returncode}")
             
-            if result.returncode == 0 and result.stdout:
-                lines = result.stdout.strip().split('\n')
+            combined = (result.stdout or '') + '\n' + (result.stderr or '')
+            
+            if result.returncode == 0 and combined:
+                lines = combined.strip().split('\n')
                 for line in reversed(lines):
                     line = line.strip()
                     if line and line.startswith('{'):
                         try:
                             info = json.loads(line)
-                            logger.info(f"JSON parsed successfully, _type: {info.get('_type')}, entries count: {len(info.get('entries', []))}")
+                            logger.info(f"JSON parsed successfully, _type: {info.get('_type')}, entries: {len(info.get('entries', []))}")
                             return info, True
                         except json.JSONDecodeError as e:
                             logger.warning(f"JSON parse error: {e}")
                             continue
-                logger.warning(f"Tentative {i}: stdout sans JSON valide")
+                logger.warning(f"Tentative {i}: pas de JSON valide trouvé dans stdout+stderr, combined length: {len(combined)}")
             else:
                 stderr = (result.stderr or '').strip()[:500]
                 logger.warning(f"Tentative {i} failed with returncode {result.returncode}: {stderr[:200]}")
