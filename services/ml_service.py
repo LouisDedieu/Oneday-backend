@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from typing import TYPE_CHECKING, Tuple, Dict, Optional
 
@@ -304,6 +306,271 @@ class MLService:
             CITY_EXTRACTION_PROMPT,
             get_city_fallback_result(),
         )
+
+    def run_inference_from_images(self, image_paths: list[str], **kwargs) -> Tuple[Dict, float]:
+        """
+        Analyse une séquence d'images (carrousel) via Gemini.
+        Utilise une image composite pour réduire les appels API.
+        Avec retry sur les erreurs serveur (500, 503).
+        """
+        if not self.is_ready():
+            raise RuntimeError("Le client Gemini n'est pas initialisé.")
+
+        if not image_paths:
+            raise ValueError("Aucune image à analyser.")
+
+        from google.genai import types
+        from services.gemini_key_pool import AllKeysExhaustedError
+        from downloader import create_composite_image
+
+        t0 = time.time()
+        last_error = None
+        max_retries = 3
+        retry_delay = 5
+
+        composite_path = None
+        uploaded_file = None
+
+        for retry in range(max_retries):
+            client = None
+
+            for key_attempt in range(self._key_pool.total_keys):
+                client, key_idx = self._key_pool.get_client()
+
+                try:
+                    if composite_path is None:
+                        if len(image_paths) == 1:
+                            logger.info("[carousel] 1 seule image, upload direct")
+                            uploaded_file = self._upload_image(client, image_paths[0])
+                            logger.info("[carousel] Upload direct (tentative %d, clé #%d)",
+                                        retry + 1, key_idx + 1)
+                            contents = [uploaded_file, TRAVEL_PROMPT]
+                        else:
+                            logger.info("[carousel] Création de l'image composite (%d images)...", len(image_paths))
+                            composite_path = os.path.join(tempfile.gettempdir(), f"carousel_composite_{int(time.time() * 1000)}.jpg")
+                            result_composite = create_composite_image(image_paths, composite_path)
+                            if not result_composite:
+                                raise RuntimeError("Échec de la création de l'image composite")
+                            logger.info("[carousel] Image composite créée : %s", composite_path)
+                            uploaded_file = self._upload_image(client, composite_path)
+                            logger.info("[carousel] Upload de l'image composite (tentative %d, clé #%d)",
+                                        retry + 1, key_idx + 1)
+                            contents = [uploaded_file, TRAVEL_PROMPT]
+                    else:
+                        uploaded_file = self._upload_image(client, composite_path)
+                        contents = [uploaded_file, TRAVEL_PROMPT]
+
+                    logger.info("[carousel] Lancement de l'analyse Gemini...")
+                    t_gen = time.time()
+                    response = client.models.generate_content(
+                        model=self._model_id,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                        ),
+                    )
+                    duration = round(time.time() - t_gen, 2)
+                    logger.info("[carousel] Génération terminée en %.2fs", duration)
+
+                    raw_text = response.text or ""
+                    result = self._parse_json(raw_text)
+
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                    if composite_path and os.path.exists(composite_path):
+                        try:
+                            os.remove(composite_path)
+                        except Exception:
+                            pass
+
+                    total_duration = round(time.time() - t0, 2)
+                    return result, total_duration
+
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_quota = "429" in error_str or ("resource" in error_str and "exhausted" in error_str)
+                    is_server_error = any(code in error_str for code in ["500", "503", "internal", "server error"])
+
+                    if is_quota:
+                        logger.warning("[carousel] Clé #%d : quota atteint", key_idx + 1)
+                        self._key_pool.mark_exhausted(key_idx)
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                        last_error = e
+                    elif is_server_error:
+                        logger.warning("[carousel] Erreur serveur Gemini (%s) - retry %d/%d",
+                                       str(e), retry + 1, max_retries)
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                        last_error = e
+                        break
+                    else:
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        raise
+
+            if last_error and "500" not in str(last_error).lower():
+                break
+
+            if retry < max_retries - 1:
+                logger.info("[carousel] Pause de %ds avant retry...", retry_delay)
+                time.sleep(retry_delay)
+
+        raise AllKeysExhaustedError(
+            f"Toutes les tentatives épuisées après {max_retries} retries. "
+            f"Dernière erreur : {last_error}"
+        )
+
+    def run_city_inference_from_images(self, image_paths: list[str], **kwargs) -> Tuple[Dict, float]:
+        """
+        Analyse une séquence d'images (carrousel) comme city guide.
+        Avec retry sur les erreurs serveur (500, 503).
+        """
+        if not self.is_ready():
+            raise RuntimeError("Le client Gemini n'est pas initialisé.")
+
+        if not image_paths:
+            raise ValueError("Aucune image à analyser.")
+
+        from google.genai import types
+        from services.gemini_key_pool import AllKeysExhaustedError
+        from downloader import create_composite_image
+
+        t0 = time.time()
+        last_error = None
+        max_retries = 3
+        retry_delay = 5
+
+        composite_path = None
+        uploaded_file = None
+
+        for retry in range(max_retries):
+            client = None
+
+            for key_attempt in range(self._key_pool.total_keys):
+                client, key_idx = self._key_pool.get_client()
+
+                try:
+                    if composite_path is None:
+                        if len(image_paths) == 1:
+                            logger.info("[carousel] 1 seule image, upload direct")
+                            uploaded_file = self._upload_image(client, image_paths[0])
+                            logger.info("[carousel] Upload direct (tentative %d, clé #%d)",
+                                        retry + 1, key_idx + 1)
+                            contents = [uploaded_file, CITY_EXTRACTION_PROMPT]
+                            file_to_upload = None
+                        else:
+                            logger.info("[carousel] Création de l'image composite (%d images)...", len(image_paths))
+                            import tempfile
+                            composite_path = os.path.join(tempfile.gettempdir(), f"carousel_composite_{int(time.time() * 1000)}.jpg")
+                            result_composite = create_composite_image(image_paths, composite_path)
+                            if not result_composite:
+                                raise RuntimeError("Échec de la création de l'image composite")
+                            logger.info("[carousel] Image composite créée : %s", composite_path)
+                            uploaded_file = self._upload_image(client, composite_path)
+                            logger.info("[carousel] Upload de l'image composite (tentative %d, clé #%d)",
+                                        retry + 1, key_idx + 1)
+                            contents = [uploaded_file, CITY_EXTRACTION_PROMPT]
+                            file_to_upload = None
+                    else:
+                        uploaded_file = self._upload_image(client, composite_path)
+                        contents = [uploaded_file, CITY_EXTRACTION_PROMPT]
+                        file_to_upload = None
+
+                    logger.info("[carousel] Lancement de l'analyse Gemini...")
+                    t_gen = time.time()
+                    response = client.models.generate_content(
+                        model=self._model_id,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                        ),
+                    )
+                    duration = round(time.time() - t_gen, 2)
+                    logger.info("[carousel] Génération terminée en %.2fs", duration)
+
+                    raw_text = response.text or ""
+                    result = self._parse_json_generic(raw_text, get_city_fallback_result())
+
+                    if uploaded_file:
+                        self._cleanup_file(client, uploaded_file)
+                    if composite_path and os.path.exists(composite_path):
+                        try:
+                            os.remove(composite_path)
+                        except Exception:
+                            pass
+
+                    total_duration = round(time.time() - t0, 2)
+                    return result, total_duration
+
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_quota = "429" in error_str or ("resource" in error_str and "exhausted" in error_str)
+                    is_server_error = any(code in error_str for code in ["500", "503", "internal", "server error"])
+
+                    if is_quota:
+                        logger.warning("[carousel] Clé #%d : quota atteint", key_idx + 1)
+                        self._key_pool.mark_exhausted(key_idx)
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                        last_error = e
+                    elif is_server_error:
+                        logger.warning("[carousel] Erreur serveur Gemini (%s) - retry %d/%d",
+                                       str(e), retry + 1, max_retries)
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        uploaded_file = None
+                        last_error = e
+                        break
+                    else:
+                        if uploaded_file:
+                            self._cleanup_file(client, uploaded_file)
+                        raise
+
+            if last_error and "500" not in str(last_error).lower():
+                break
+
+            if retry < max_retries - 1:
+                logger.info("[carousel] Pause de %ds avant retry...", retry_delay)
+                time.sleep(retry_delay)
+
+        raise AllKeysExhaustedError(
+            f"Toutes les tentatives épuisées après {max_retries} retries. "
+            f"Dernière erreur : {last_error}"
+        )
+
+    def _upload_image(self, client, image_path: str):
+        """Upload une image vers Gemini File API et attend qu'elle soit ACTIVE."""
+        import mimetypes
+        from google.genai import types as genai_types
+
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+        logger.info("Upload de l'image vers Gemini File API : %s", image_path)
+
+        uploaded_file = client.files.upload(
+            file=image_path,
+            config=genai_types.UploadFileConfig(mime_type=mime_type),
+        )
+        logger.info("Fichier uploadé : %s (state=%s)", uploaded_file.name, uploaded_file.state)
+
+        # Attendre ACTIVE
+        max_wait = 60
+        waited = 0
+        while str(uploaded_file.state) not in ("FileState.ACTIVE", "ACTIVE"):
+            if waited >= max_wait:
+                raise RuntimeError("Timeout : le fichier Gemini n'est pas devenu ACTIVE.")
+            time.sleep(1)
+            waited += 1
+            uploaded_file = client.files.get(name=uploaded_file.name)
+            logger.debug("File state: %s (attendu depuis %ds)", uploaded_file.state, waited)
+
+        logger.info("Image ACTIVE après %ds — prête pour l'analyse.", waited)
+        return uploaded_file
 
     @staticmethod
     def _cleanup_file(client, uploaded_file):

@@ -8,6 +8,13 @@ python-multipart>=0.0.6
 # Video Processing
 yt-dlp>=2024.1.0
 
+# Instagram carousel support
+instaloader>=4.10
+Pillow>=10.0.0
+
+# TikTok carousel support
+gallery-dl>=1.27.0
+
 # Gemini AI API
 google-genai>=1.0.0
 
