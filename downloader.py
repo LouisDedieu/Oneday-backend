@@ -116,6 +116,8 @@ def _extract_carousel_image_urls(info: dict) -> list[dict]:
     image_urls = []
     image_extensions = {'jpg', 'jpeg', 'png', 'webp'}
     
+    logger.debug(f"Keys disponibles dans info: {list(info.keys())}")
+    
     entries = info.get('entries', [])
     for entry in entries:
         if not entry:
@@ -148,6 +150,30 @@ def _extract_carousel_image_urls(info: dict) -> list[dict]:
                 url = thumb.get('url') or thumb.get('src')
                 if url:
                     image_urls.append({'url': url, 'ext': 'jpg'})
+    
+    children = info.get('children', [])
+    for child in children:
+        if isinstance(child, dict):
+            url = child.get('url')
+            ext = child.get('ext', 'jpg').lower()
+            if url and ext in image_extensions:
+                image_urls.append({'url': url, 'ext': ext})
+    
+    carousel_data = info.get('carousel_parent', {})
+    if carousel_data:
+        carousel_images = carousel_data.get('image_versions', [])
+        for img in carousel_images:
+            if isinstance(img, dict):
+                url = img.get('url') or img.get('image')
+                if url:
+                    image_urls.append({'url': url, 'ext': 'jpg'})
+    
+    candidate_candidates = info.get('candidate', [])
+    for cand in candidate_candidates:
+        if isinstance(cand, dict):
+            url = cand.get('url')
+            if url:
+                image_urls.append({'url': url, 'ext': 'jpg'})
     
     return image_urls
 
@@ -524,21 +550,48 @@ def _download_with_info(
     """
     Télécharge et retourne les métadonnées yt-dlp pour détection de carrousel.
     Retourne (info_dict, success).
+    Utilise --dump-json pour obtenir les métadonnées complètes.
     """
+    import json
+    import tempfile
+    
     has_curl = _curl_cffi_available()
     strategies = _build_strategies(cookies_file, proxy, has_curl)
+    tmp_path = None
     
     for i, strategy in enumerate(strategies, start=1):
         opts = strategy.build_ydl_opts(output_path)
         opts['skip_download'] = True
+        opts['dump_single_json'] = True
+        opts['no_warnings'] = True
+        opts['quiet'] = True
         
         try:
+            with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as tmp:
+                tmp_path = tmp.name
+                opts['outtmpl'] = {'infojson': tmp.name}
+            
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info:
-                    return info, True
+                ydl.download([url])
+            
+            with open(tmp_path, 'r') as f:
+                info = json.load(f)
+            
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+            
+            if info:
+                logger.debug(f"Métadonnées complètes récupérées, keys: {list(info.keys())[:20]}")
+                return info, True
         except Exception as e:
             logger.debug("Tentative %d échouée pour info extraction: %s", i, e)
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
             continue
     
     return {}, False
