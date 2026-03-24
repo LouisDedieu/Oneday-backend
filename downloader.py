@@ -1017,6 +1017,11 @@ async def download_content(
     validated_url = validate_url(url)
     logger.info("Téléchargement de %s", validated_url)
     
+    resolved_url = _resolve_tiktok_url(validated_url)
+    if resolved_url and resolved_url != validated_url:
+        validated_url = resolved_url
+        logger.info("URL résolue: %s", validated_url)
+    
     loop = asyncio.get_running_loop()
     video_path = os.path.join(output_dir, "video.mp4")
     os.makedirs(output_dir, exist_ok=True)
@@ -1051,9 +1056,10 @@ async def download_content(
         is_empty_or_missing = "vide ou introuvable" in error_msg
         is_unsupported = "unsupported url" in error_msg
         is_photo_url = "/photo/" in validated_url.lower()
+        is_tiktok = "tiktok.com" in validated_url.lower()
         
-        if is_unsupported and is_photo_url:
-            logger.info("URL photo non supportée par yt-dlp, tentative carrousel...")
+        if is_unsupported and (is_photo_url or is_tiktok):
+            logger.info("URL TikTok non supportée ou /photo/, tentative carrousel...")
         elif is_empty_or_missing:
             logger.info("Fichier vidéo vide ou inexistant, tentative carrousel...")
         else:
