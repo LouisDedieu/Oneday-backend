@@ -262,6 +262,69 @@ class VideoTooLongError(ValueError):
     """La vidéo dépasse la durée maximale autorisée."""
 
 
+def _download_carousel_instaloader(url: str, output_dir: str) -> tuple[list[str], int]:
+    """
+    Télécharge les images d'un carrousel Instagram via instaloader.
+    Retourne (file_paths, image_count).
+    """
+    try:
+        import instaloader
+    except ImportError:
+        logger.warning("instaloader non installé, impossible de télécharger le carrousel")
+        return [], 0
+    
+    os.makedirs(output_dir, exist_ok=True)
+    file_paths: list[str] = []
+    
+    try:
+        L = instaloader.Instaloader(
+            download_pictures=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            dirname_pattern=output_dir,
+        )
+        
+        shortcode = url.split("/p/")[1].split("/")[0] if "/p/" in url else None
+        if not shortcode:
+            logger.warning("Impossible d'extraire le shortcode de l'URL")
+            return [], 0
+        
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        
+        if not post.is_carousel:
+            logger.info("Le post n'est pas un carrousel")
+            return [], 0
+        
+        logger.info(f"Téléchargement du carrousel {shortcode} ({len(post.get_sidecar_nodes())} images)")
+        
+        for idx, node in enumerate(post.get_sidecar_nodes()):
+            image_url = node.url
+            ext = 'jpg'
+            output_path = os.path.join(output_dir, f"image_{idx:03d}.{ext}")
+            
+            try:
+                import httpx
+                response = httpx.get(image_url, timeout=30, follow_redirects=True)
+                response.raise_for_status()
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+                
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    file_paths.append(output_path)
+                    logger.info(f"Image {idx+1} téléchargée : {os.path.getsize(output_path)} octets")
+            except Exception as e:
+                logger.warning(f"Échec téléchargement image {idx}: {e}")
+                continue
+        
+        return file_paths, len(file_paths)
+        
+    except Exception as e:
+        logger.warning(f"instaloader a échoué: {e}")
+        return [], 0
+
+
 # ── Stratégies ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -640,21 +703,26 @@ async def download_content(
     
     if content_type == ContentType.CAROUSEL:
         os.makedirs(output_dir, exist_ok=True)
+        
         file_paths, image_count = await loop.run_in_executor(
             None,
             partial(_download_carousel_images, info, output_dir)
         )
         
         if not file_paths:
-            logger.warning("Carrousel détecté mais aucune image téléchargée → fallback vidéo")
-            content_type = ContentType.VIDEO
-            image_count = 0
-            return DownloadResult(
-                content_type=content_type,
-                file_paths=[],
-                duration_seconds=0.0,
-                image_count=image_count,
+            logger.info("Aucune image dans métadonnées, tentative via instaloader...")
+            file_paths, image_count = await loop.run_in_executor(
+                None,
+                partial(_download_carousel_instaloader, validated_url, output_dir)
             )
+        
+        if not file_paths:
+            raise DownloadError(
+                "Impossible de télécharger les images de ce carrousel Instagram. "
+                "L'analyse de carrousels nécessite soit des cookies Instagram, soit instaloader installé."
+            )
+        
+        logger.info(f"Carrousel téléchargé : {image_count} images")
         
         return DownloadResult(
             content_type=content_type,
