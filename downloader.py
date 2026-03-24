@@ -77,8 +77,10 @@ def _detect_content_type(info: dict) -> ContentType:
     """
     Détecte si le contenu est une vidéo ou un carrousel d'images.
     
-    Instagram carrousels : 'entries' existe avec plusieurs images
-    TikTok carrousels : '_type' == 'playlist' avec images
+    Détection par ordre de priorité:
+    1. 'entries' avec plusieurs images (TikTok/playlists)
+    2. Instagram carousel indicators (media_type, num_slides, carousel)
+    3. '_type' == 'playlist' ou 'multi_video'
     """
     if 'entries' in info and info['entries']:
         entries = info['entries']
@@ -90,6 +92,19 @@ def _detect_content_type(info: dict) -> ContentType:
             )
             if all_images:
                 return ContentType.CAROUSEL
+    
+    carousel_indicators = [
+        info.get('media_type') == 8,
+        info.get('num_slides', 0) > 1,
+        info.get('carousel_title') is not None,
+        info.get('is_unified_collection') == True,
+        info.get('_type') in ('playlist', 'multi_video'),
+        'carousel' in (info.get('title') or '').lower(),
+    ]
+    
+    if any(carousel_indicators):
+        return ContentType.CAROUSEL
+    
     return ContentType.VIDEO
 
 

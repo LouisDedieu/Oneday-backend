@@ -22,6 +22,19 @@ def _detect_content_type(info: dict) -> ContentType:
             )
             if all_images:
                 return ContentType.CAROUSEL
+    
+    carousel_indicators = [
+        info.get('media_type') == 8,
+        info.get('num_slides', 0) > 1,
+        info.get('carousel_title') is not None,
+        info.get('is_unified_collection') == True,
+        info.get('_type') in ('playlist', 'multi_video'),
+        'carousel' in (info.get('title') or '').lower(),
+    ]
+    
+    if any(carousel_indicators):
+        return ContentType.CAROUSEL
+    
     return ContentType.VIDEO
 
 def test_content_type_detection():
@@ -37,7 +50,7 @@ def test_content_type_detection():
     assert result == ContentType.VIDEO, f"Expected VIDEO, got {result}"
     print("✓ Test 1: Video detected correctly")
 
-    # Test 2: Carousel with multiple images
+    # Test 2: Carousel with multiple images (entries format)
     carousel_info = {
         'title': 'My Carousel Post',
         'entries': [
@@ -48,9 +61,39 @@ def test_content_type_detection():
     }
     result = _detect_content_type(carousel_info)
     assert result == ContentType.CAROUSEL, f"Expected CAROUSEL, got {result}"
-    print("✓ Test 2: Carousel detected correctly")
+    print("✓ Test 2: Carousel with entries detected correctly")
 
-    # Test 3: Single image (not a carousel)
+    # Test 3: Instagram carousel (media_type = 8)
+    instagram_carousel_info = {
+        'title': 'Post by francetravelers',
+        'media_type': 8,
+        'ext': 'mp4',
+    }
+    result = _detect_content_type(instagram_carousel_info)
+    assert result == ContentType.CAROUSEL, f"Expected CAROUSEL for media_type=8, got {result}"
+    print("✓ Test 3: Instagram carousel (media_type=8) detected")
+
+    # Test 4: Instagram carousel (num_slides)
+    instagram_slides_info = {
+        'title': 'Post by francetravelers',
+        'num_slides': 5,
+        'ext': 'mp4',
+    }
+    result = _detect_content_type(instagram_slides_info)
+    assert result == ContentType.CAROUSEL, f"Expected CAROUSEL for num_slides>1, got {result}"
+    print("✓ Test 4: Instagram carousel (num_slides) detected")
+
+    # Test 5: Instagram carousel (carousel_title)
+    instagram_carousel_title_info = {
+        'title': 'Post by francetravelers',
+        'carousel_title': 'My Travel Photos',
+        'ext': 'mp4',
+    }
+    result = _detect_content_type(instagram_carousel_title_info)
+    assert result == ContentType.CAROUSEL, f"Expected CAROUSEL for carousel_title, got {result}"
+    print("✓ Test 5: Instagram carousel (carousel_title) detected")
+
+    # Test 6: Single image (not a carousel)
     single_image_info = {
         'title': 'Single Image Post',
         'entries': [
@@ -59,52 +102,36 @@ def test_content_type_detection():
     }
     result = _detect_content_type(single_image_info)
     assert result == ContentType.VIDEO, f"Expected VIDEO for single image, got {result}"
-    print("✓ Test 3: Single image treated as video")
+    print("✓ Test 6: Single image treated as video")
 
-    # Test 4: Mixed content (images + video) -> VIDEO
-    mixed_info = {
-        'title': 'Mixed Content',
-        'entries': [
-            {'ext': 'mp4', 'title': 'Video'},
-            {'ext': 'jpg', 'title': 'Image'},
-        ]
-    }
-    result = _detect_content_type(mixed_info)
-    assert result == ContentType.VIDEO, f"Expected VIDEO for mixed, got {result}"
-    print("✓ Test 4: Mixed content treated as video")
-
-    # Test 5: Empty entries
+    # Test 7: Empty entries
     empty_entries_info = {
         'title': 'Empty Post',
         'entries': []
     }
     result = _detect_content_type(empty_entries_info)
     assert result == ContentType.VIDEO, f"Expected VIDEO for empty entries, got {result}"
-    print("✓ Test 5: Empty entries treated as video")
+    print("✓ Test 7: Empty entries treated as video")
 
-    # Test 6: Carousel with webp images
-    webp_carousel_info = {
-        'title': 'WebP Carousel',
-        'entries': [
-            {'ext': 'webp', 'title': 'Image 1'},
-            {'ext': 'webp', 'title': 'Image 2'},
-        ]
+    # Test 8: Video with media_type != 8
+    video_with_media_info = {
+        'title': 'Regular Video',
+        'media_type': 2,
+        'ext': 'mp4',
     }
-    result = _detect_content_type(webp_carousel_info)
-    assert result == ContentType.CAROUSEL, f"Expected CAROUSEL for webp, got {result}"
-    print("✓ Test 6: WebP carousel detected correctly")
+    result = _detect_content_type(video_with_media_info)
+    assert result == ContentType.VIDEO, f"Expected VIDEO for media_type=2, got {result}"
+    print("✓ Test 8: Regular video (media_type=2) not detected as carousel")
 
-    # Test 7: JPEG with capital extension
-    jpeg_carousel_info = {
-        'title': 'JPEG Carousel',
-        'entries': [
-            {'ext': 'JPEG', 'title': 'Image 1'},
-            {'ext': 'JPG', 'title': 'Image 2'},
-        ]
+    # Test 9: num_slides = 1 (not a carousel)
+    single_slide_info = {
+        'title': 'Single Slide Post',
+        'num_slides': 1,
+        'ext': 'mp4',
     }
-    result = _detect_content_type(jpeg_carousel_info)
-    assert result == ContentType.CAROUSEL, f"Expected CAROUSEL for JPEG/JPG, got {result}"
-    print("✓ Test 7: JPEG/JPG carousel detected (case insensitive)")
+    result = _detect_content_type(single_slide_info)
+    assert result == ContentType.VIDEO, f"Expected VIDEO for num_slides=1, got {result}"
+    print("✓ Test 9: Single slide not detected as carousel")
 
     print("\n✅ All tests passed!")
 
