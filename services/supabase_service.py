@@ -93,6 +93,9 @@ class SupabaseService:
                 headers=self._get_headers(),
                 timeout=10,
             )
+            if not response.is_success:
+                error_body = response.text
+                logger.error(f"❌ PATCH {table} → {response.status_code} | body: {error_body}")
             response.raise_for_status()
 
     async def create_job(
@@ -120,10 +123,13 @@ class SupabaseService:
         if not self.is_configured():
             return
         try:
+            logger.debug(f"Mise à jour job {job_id} avec payload: {updates}")
             await self.update("analysis_jobs", updates, "id", job_id)
             logger.debug(f"Job {job_id} mis à jour dans Supabase")
         except Exception as e:
             logger.error(f"Erreur mise à jour Supabase pour job {job_id}: {e}")
+            # Log le payload pour debug
+            logger.error(f"Payload qui a causé l'erreur: {updates}")
 
     async def create_trip(
             self, trip_data: Dict, job_id: str, user_id: Optional[str] = None
@@ -163,7 +169,6 @@ class SupabaseService:
                 # à chaque INSERT/DELETE sur itinerary_days
                 "best_season": trip_data.get("best_season"),
                 "source_url": trip_data.get("source_url"),
-                "normalized_source_url": trip_data.get("normalized_source_url"),
                 "content_creator_handle": trip_data.get("content_creator", {}).get(
                     "handle"
                 ),
@@ -212,10 +217,44 @@ class SupabaseService:
 
             logger.info(f"city_to_dest_id: {city_to_dest_id}")
 
+            # Fallback: si aucune destination, créer une destination basée sur le trip_title
+            if not city_to_dest_id:
+                # Extraire le nom de ville du trip_title (ex: "5 day itinerary CRETE" -> "CRETE")
+                trip_title = trip_data.get("trip_title", "")
+                # Essayer d'extraire une ville du titre
+                city_name = "Inconnu"
+                import re
+                # Patterns courants: "X day itinerary CITY", "Trip to CITY", "CITY in X days"
+                match = re.search(r'(?i)(?:itinerary|trip to|in|to)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)', trip_title)
+                if match:
+                    city_name = match.group(1).strip().title()
+                
+                logger.warning(
+                    f"Aucune destination détectée dans l'analyse, création d'une destination fallback '{city_name}'"
+                )
+                days_count = len(trip_data.get("itinerary", [])) or trip_data.get("duration_days", 1)
+                dest_row = _sb_insert(
+                    "destinations",
+                    {
+                        "trip_id": trip_id,
+                        "city": city_name,
+                        "country": None,
+                        "days_spent": days_count,
+                        "visit_order": 1,
+                    },
+                )
+                if dest_row.get("id"):
+                    city_to_dest_id[city_name.lower()] = dest_row["id"]
+                    logger.info(f"Destination fallback créée: {dest_row['id']} ({city_name})")
+
             # 3. Itinéraire
+            fallback_dest_id = city_to_dest_id.get("inconnu") or (list(city_to_dest_id.values())[0] if city_to_dest_id else None)
             for day_data in trip_data.get("itinerary", []):
                 location = day_data.get("location")
+                # Utiliser la destination correspondante, ou le fallback "Inconnu" si aucun match
                 destination_id = city_to_dest_id.get(location.lower().strip()) if location else None
+                if not destination_id and fallback_dest_id:
+                    destination_id = fallback_dest_id
 
                 day_row_data: dict = {
                     "trip_id": trip_id,
@@ -285,13 +324,40 @@ class SupabaseService:
 
             # 5. Logistique
             for idx, log in enumerate(trip_data.get("logistics", [])):
+                # Normalize transport mode to valid enum value
+                # Valid enum values in Supabase (FRANÇAIS): avion, train, bus, voiture, ferry, autre
+                mode = log.get("mode", "").lower().strip()
+
+                # Mapping anglais → français
+                en_to_fr_mapping = {
+                    "plane": "avion",
+                    "flight": "avion",
+                    "airplane": "avion",
+                    "train": "train",
+                    "bus": "bus",
+                    "car": "voiture",
+                    "ferry": "ferry",
+                    "walk": "autre",  # marche n'existe pas, utiliser "autre"
+                    "walking": "autre",
+                    "other": "autre",
+                }
+
+                if mode in en_to_fr_mapping:
+                    mode = en_to_fr_mapping[mode]
+                else:
+                    # Vérifier si déjà en français
+                    valid_modes_fr = {"avion", "train", "bus", "voiture", "ferry", "autre"}
+                    if mode not in valid_modes_fr:
+                        logger.warning(f"Mode de transport invalide '{mode}' → fallback sur 'autre'")
+                        mode = "autre"
+
                 _sb_insert(
                     "logistics",
                     {
                         "trip_id": trip_id,
                         "from_location": log.get("from"),
                         "to_location": log.get("to"),
-                        "transport_mode": log.get("mode"),
+                        "transport_mode": mode,
                         "duration": log.get("duration"),
                         "cost": log.get("cost"),
                         "tips": log.get("tips"),
@@ -583,7 +649,6 @@ class SupabaseService:
                 "vibe_tags": city_data.get("vibe_tags", []),
                 "best_season": city_data.get("best_season"),
                 "source_url": city_data.get("source_url"),
-                "normalized_source_url": city_data.get("normalized_source_url"),
                 "content_creator_handle": city_data.get("content_creator", {}).get("handle"),
                 "content_creator_links": city_data.get("content_creator", {}).get("links_mentioned", []),
                 "content_type": city_data.get("content_type", "video"),
@@ -700,51 +765,111 @@ class SupabaseService:
     # =========================================================================
 
     async def find_trip_by_source_url(self, source_url: str) -> Optional[Dict]:
-        """Cherche un trip existant par source_url. Retourne {id, trip_title, type} ou None."""
+        """
+        Cherche un trip existant par source_url. Retourne {id, trip_title, type} ou None.
+        Ignore les trips dont le job est en erreur (trips incomplets/corrompus).
+        """
         if not self.is_configured():
             return None
         try:
             async with httpx.AsyncClient() as client:
+                # Récupérer le trip avec son job_id
                 response = await client.get(
                     self._get_url("trips"),
                     params={
                         "source_url": f"eq.{source_url}",
                         "limit": "1",
-                        "select": "id,trip_title",
+                        "select": "id,trip_title,job_id",
                     },
                     headers=self._get_headers(),
                     timeout=10,
                 )
                 response.raise_for_status()
                 rows = response.json()
-                if rows:
-                    return {**rows[0], "type": "trip"}
-                return None
+                if not rows:
+                    return None
+
+                trip = rows[0]
+                job_id = trip.get("job_id")
+
+                # Si pas de job_id (création manuelle), considérer comme valide
+                if not job_id:
+                    return {**trip, "type": "trip"}
+
+                # Vérifier le statut du job
+                job_response = await client.get(
+                    self._get_url("analysis_jobs"),
+                    params={
+                        "id": f"eq.{job_id}",
+                        "select": "status",
+                    },
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                job_response.raise_for_status()
+                jobs = job_response.json()
+
+                # Si le job est en erreur, ignorer ce trip (doublon invalide)
+                if jobs and jobs[0].get("status") == "error":
+                    logger.info(f"Trip {trip['id']} ignoré : job {job_id} en erreur")
+                    return None
+
+                return {**trip, "type": "trip"}
         except Exception as e:
             logger.error(f"Erreur find_trip_by_source_url: {e}")
             return None
 
     async def find_city_by_source_url(self, source_url: str) -> Optional[Dict]:
-        """Cherche une city existante par source_url. Retourne {id, city_title, type} ou None."""
+        """
+        Cherche une city existante par source_url. Retourne {id, city_title, type} ou None.
+        Ignore les cities dont le job est en erreur (cities incomplètes/corrompues).
+        """
         if not self.is_configured():
             return None
         try:
             async with httpx.AsyncClient() as client:
+                # Récupérer la city avec son job_id
                 response = await client.get(
                     self._get_url("cities"),
                     params={
                         "source_url": f"eq.{source_url}",
                         "limit": "1",
-                        "select": "id,city_title",
+                        "select": "id,city_title,job_id",
                     },
                     headers=self._get_headers(),
                     timeout=10,
                 )
                 response.raise_for_status()
                 rows = response.json()
-                if rows:
-                    return {**rows[0], "type": "city"}
-                return None
+                if not rows:
+                    return None
+
+                city = rows[0]
+                job_id = city.get("job_id")
+
+                # Si pas de job_id (création manuelle), considérer comme valide
+                if not job_id:
+                    return {**city, "type": "city"}
+
+                # Vérifier le statut du job
+                job_response = await client.get(
+                    self._get_url("analysis_jobs"),
+                    params={
+                        "id": f"eq.{job_id}",
+                        "select": "status",
+                    },
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                job_response.raise_for_status()
+                jobs = job_response.json()
+
+                # Si le job est en erreur, ignorer cette city (doublon invalide)
+                if jobs and jobs[0].get("status") == "error":
+                    logger.info(f"City {city['id']} ignorée : job {job_id} en erreur")
+                    return None
+
+                return {**city, "type": "city"}
         except Exception as e:
             logger.error(f"Erreur find_city_by_source_url: {e}")
             return None
@@ -967,7 +1092,6 @@ class SupabaseService:
                 "trip_title": title or (TRIP_TEMPLATE.get("trip_title") if use_template else "Mon nouveau voyage"),
                 "vibe": TRIP_TEMPLATE.get("vibe") if use_template else None,
                 "source_url": None,
-                "normalized_source_url": None,
                 "content_creator_handle": None,
             }
 
@@ -1074,7 +1198,6 @@ class SupabaseService:
                 "country": "",
                 "vibe_tags": [],
                 "source_url": None,
-                "normalized_source_url": None,
                 "content_creator_handle": None,
             }
 

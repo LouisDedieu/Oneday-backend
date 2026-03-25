@@ -110,15 +110,29 @@ class MLService:
         )
 
     def _upload_and_wait(self, client, video_path: str):
-        """Upload une vidéo vers Gemini File API et attend qu'elle soit ACTIVE."""
+        """Upload un fichier vers Gemini File API et attend qu'elle soit ACTIVE."""
+        import mimetypes
         from google.genai import types
 
-        logger.info("Upload de la vidéo vers Gemini File API : %s", video_path)
+        # Detect mime type based on file extension
+        mime_type = mimetypes.guess_type(video_path)[0]
+        logger.info("[GEMINI_UPLOAD] Starting upload - path: %s, detected mime: %s", video_path, mime_type)
+        
+        if not mime_type:
+            # Default to text/plain for .txt files (blog content)
+            if video_path.endswith('.txt'):
+                mime_type = "text/plain"
+                logger.info("[GEMINI_UPLOAD] Using text/plain for .txt file")
+            else:
+                mime_type = "video/mp4"
+                logger.info("[GEMINI_UPLOAD] Using default video/mp4")
+
+        logger.info("[GEMINI_UPLOAD] Uploading to Gemini: path=%s, mime=%s", video_path, mime_type)
         uploaded_file = client.files.upload(
             file=video_path,
-            config=types.UploadFileConfig(mime_type="video/mp4"),
+            config=types.UploadFileConfig(mime_type=mime_type),
         )
-        logger.info("Fichier uploadé : %s (state=%s)", uploaded_file.name, uploaded_file.state)
+        logger.info("[GEMINI_UPLOAD] File uploaded - name: %s, state: %s", uploaded_file.name, uploaded_file.state)
 
         # Attendre ACTIVE
         max_wait = 120

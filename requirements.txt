@@ -15,6 +15,10 @@ Pillow>=10.0.0
 # TikTok carousel support
 gallery-dl>=1.27.0
 
+# Blog content extraction
+beautifulsoup4>=4.12.0
+readability-lxml>=3.0.0
+
 # Gemini AI API
 google-genai>=1.0.0
 

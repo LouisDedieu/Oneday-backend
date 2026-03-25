@@ -39,12 +39,28 @@ from enum import Enum
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from readability import Document
+except ImportError:
+    Document = None
+
 logger = logging.getLogger("bombo.downloader")
 
 
 class ContentType(str, Enum):
     VIDEO = "video"
     CAROUSEL = "carousel"
+    BLOG = "blog"
     UNKNOWN = "unknown"
 
 
@@ -54,6 +70,8 @@ class DownloadResult:
     file_paths: list[str] = field(default_factory=list)
     duration_seconds: float = 0.0
     image_count: int = 0
+    word_count: int = 0
+    estimated_read_time: int = 0
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -66,11 +84,24 @@ SUPPORTED_DOMAINS = {
     "www.instagram.com",
 }
 
+BLOG_DOMAINS = {
+    "medium.com",
+    "www.medium.com",
+    "substack.com",
+    "www.substack.com",
+    "wordpress.com",
+    "www.wordpress.com",
+    "blogspot.com",
+    "www.blogspot.com",
+}
+
 URL_RE = re.compile(r"https?://(?P<domain>[^/\s]+)", re.IGNORECASE)
+BLOG_PATH_RE = re.compile(r"/blog/|/article/", re.IGNORECASE)
 
 DOWNLOAD_TIMEOUT = 120  # secondes
 MAX_VIDEO_DURATION = 300  # 5 minutes en secondes
 MAX_CAROUSEL_IMAGES = 20  # Limite pour éviter les carrousels trop longs
+MAX_BLOG_WORDS = 10000  # Limite de mots pour éviter de dépasser les tokens IA
 
 
 def _detect_content_type(info: dict) -> ContentType:
@@ -738,16 +769,20 @@ def _build_strategies(
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def validate_url(url: str) -> str:
+    """
+    Valide l'URL. Accepte TikTok, Instagram, ou tout autre site (traité comme blog).
+    """
     url = url.strip()
     m = URL_RE.match(url)
     if not m:
         raise UnsupportedURLError(f"URL malformée : {url!r}")
     domain = m.group("domain").lower()
-    if domain not in SUPPORTED_DOMAINS:
-        raise UnsupportedURLError(
-            f"Domaine non supporté : '{domain}'. "
-            "Seuls TikTok et Instagram sont acceptés."
-        )
+    
+    # Accept TikTok, Instagram, or any other URL (treated as potential blog)
+    if domain in SUPPORTED_DOMAINS:
+        return url
+    
+    # Everything else is treated as a blog
     return url
 
 
@@ -1004,6 +1039,112 @@ def _download_with_info(
     return {}, False
 
 
+def is_blog_url(url: str) -> bool:
+    """
+    Détecte si une URL doit être traitée comme un article de blog.
+    Retourne True pour tout URL qui n'est pas TikTok ou Instagram.
+    """
+    url_lower = url.lower()
+    
+    # Check if it's TikTok or Instagram - those are not blogs
+    for domain in SUPPORTED_DOMAINS:
+        if domain in url_lower:
+            return False
+    
+    # Everything else is treated as a blog
+    return True
+
+
+def extract_blog_content(url: str) -> dict:
+    """
+    Extrait le contenu textuel d'un article de blog.
+    Retourne un dict avec title, content, word_count, estimated_read_time.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+    try:
+        from readability import Document
+    except ImportError:
+        logger.warning("readability-lxml non installé, utilisation de BeautifulSoup seul")
+        Document = None
+    
+    logger.info(f"Extraction du contenu blog: {url}")
+    
+    try:
+        response = httpx.get(url, timeout=30, follow_redirects=True, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        })
+        response.raise_for_status()
+        html = response.text
+        
+        title = url
+        content = ""
+        
+        # Try readability first for clean article extraction
+        if Document:
+            try:
+                doc = Document(html)
+                title = doc.title() or title
+                # Get text content
+                soup = BeautifulSoup(doc.summary(), 'html.parser')
+                content = soup.get_text(separator='\n', strip=True)
+            except Exception as e:
+                logger.warning(f"readability extraction failed: {e}, falling back to BeautifulSoup")
+                soup = BeautifulSoup(html, 'html.parser')
+                # Try to find article content
+                article = soup.find('article') or soup.find('main') or soup.find('div', class_=lambda x: x and 'content' in x.lower())
+                if article:
+                    content = article.get_text(separator='\n', strip=True)
+                else:
+                    content = soup.get_text(separator='\n', strip=True)
+        else:
+            soup = BeautifulSoup(html, 'html.parser')
+            # Try common article containers
+            article = soup.find('article') or soup.find('main') or soup.find('div', class_=lambda x: x and 'content' in x.lower())
+            if article:
+                content = article.get_text(separator='\n', strip=True)
+            else:
+                content = soup.get_text(separator='\n', strip=True)
+        
+        # Clean up content
+        lines = [line.strip() for line in content.split('\n') if line.strip()]
+        content = '\n'.join(lines)
+        
+        # Count words
+        word_count = len(content.split())
+        
+        # Limit to MAX_BLOG_WORDS
+        if word_count > MAX_BLOG_WORDS:
+            words = content.split()
+            content = ' '.join(words[:MAX_BLOG_WORDS])
+            word_count = MAX_BLOG_WORDS
+            logger.info(f"Contenu blog limité à {MAX_BLOG_WORDS} mots")
+        
+        # Estimate read time (200 words per minute)
+        estimated_read_time = max(1, round(word_count / 200))
+        
+        logger.info(f"Blog extrait: {word_count} mots, ~{estimated_read_time} min de lecture")
+        
+        return {
+            "title": title,
+            "content": content,
+            "word_count": word_count,
+            "estimated_read_time": estimated_read_time,
+        }
+        
+    except httpx.HTTPError as e:
+        logger.error(f"HTTP error extracting blog: {e}")
+        raise BlogExtractionError(f"Impossible d'accéder à l'article: {e}")
+    except Exception as e:
+        logger.error(f"Error extracting blog content: {e}")
+        raise BlogExtractionError(f"Erreur lors de l'extraction: {e}")
+
+
+class BlogExtractionError(Exception):
+    """Erreur lors de l'extraction du contenu blog"""
+    pass
+
+
 async def download_content(
     url: str,
     output_dir: str,
@@ -1011,9 +1152,38 @@ async def download_content(
     proxy: str | None = None,
 ) -> DownloadResult:
     """
-    Télécharge une vidéo ou un carrousel d'images.
+    Télécharge une vidéo, un carrousel d'images, ou extrait un article de blog.
     Retourne un DownloadResult avec le type détecté et les chemins de fichiers.
     """
+    # Check if it's a blog URL first
+    if is_blog_url(url):
+        logger.info("[DOWNLOAD_BLOG] Starting blog extraction for: %s", url)
+        try:
+            loop = asyncio.get_running_loop()
+            blog_data = await loop.run_in_executor(None, extract_blog_content, url)
+            
+            # Save content to a text file
+            content_file = os.path.join(output_dir, "content.txt")
+            logger.info("[DOWNLOAD_BLOG] Saving content to: %s", content_file)
+            with open(content_file, 'w', encoding='utf-8') as f:
+                f.write(f"# {blog_data['title']}\n\n")
+                f.write(blog_data['content'])
+            
+            logger.info("[DOWNLOAD_BLOG] Content saved - title: %s, words: %d, read_time: %d min",
+                blog_data['title'], blog_data['word_count'], blog_data['estimated_read_time'])
+            
+            return DownloadResult(
+                content_type=ContentType.BLOG,
+                file_paths=[content_file],
+                word_count=blog_data['word_count'],
+                estimated_read_time=blog_data['estimated_read_time'],
+            )
+        except BlogExtractionError:
+            raise
+        except Exception as e:
+            logger.error(f"Erreur extraction blog: {e}")
+            raise BlogExtractionError(f"Erreur lors de l'extraction: {e}")
+    
     validated_url = validate_url(url)
     logger.info("Téléchargement de %s", validated_url)
     

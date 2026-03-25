@@ -24,6 +24,7 @@ from downloader import (
     IPBlockedError,
     DownloadError,
     VideoTooLongError,
+    BlogExtractionError,
     _resolve_tiktok_url,
 )
 
@@ -108,9 +109,8 @@ class JobProcessor:
                         )
                         update_data: Dict = {
                             "status": "done",
-                            "completed_at": datetime.utcnow().isoformat(),
-                            "duration_seconds": 0,
                             "entity_type": entity_type,
+                            "completed_at": datetime.utcnow().isoformat(),
                         }
                         if entity_type == "city":
                             update_data["city_id"] = new_id
@@ -131,6 +131,7 @@ class JobProcessor:
             tmp_dir = os.path.join(tempfile.gettempdir(), f"bombo_{job_id}")
             os.makedirs(tmp_dir, exist_ok=True)
 
+            download_result = None
             try:
                 download_result = await download_content(
                     full_url,
@@ -144,17 +145,63 @@ class JobProcessor:
                 image_count = download_result.image_count
 
             except UnsupportedURLError:
-                error_msg = "URL non supportée (accepte TikTok, Instagram Reels)."
+                error_msg = "URL non supportée (accepte TikTok, Instagram, ou articles de blog)."
                 await self._handle_error(job_id, error_msg, request.user_id, request.url)
                 return
             except VideoTooLongError as exc:
                 await self._handle_video_too_long_error(job_id, str(exc), request.user_id, request.url)
                 return
-            except (PrivateVideoError, IPBlockedError, DownloadError) as exc:
-                await self._handle_error(job_id, str(exc), request.user_id, request.url)
+            except BlogExtractionError as exc:
+                error_msg = f"Impossible d'extraire le contenu de l'article: {exc}"
+                await self._handle_error(job_id, error_msg, request.user_id, request.url)
                 return
+            except (PrivateVideoError, IPBlockedError, DownloadError) as exc:
+                is_instagram_post = "/p/" in full_url.lower() and "instagram.com" in full_url.lower()
+                if is_instagram_post and isinstance(exc, PrivateVideoError):
+                    logger.info("[job %s] Instagram /p/ inaccessible — tentative gallery-dl", job_id)
+                    try:
+                        from downloader import _download_instagram_gallery_dl, _download_carousel_instaloader
+                        loop = asyncio.get_event_loop()
 
-            if content_type == ContentType.CAROUSEL:
+                        # Tentative 1: gallery-dl
+                        file_paths, image_count = await loop.run_in_executor(
+                            None,
+                            _download_instagram_gallery_dl,
+                            full_url,
+                            tmp_dir,
+                        )
+                        logger.info("[job %s] Gallery-dl: %d images récupérées", job_id, len(file_paths))
+
+                        # Tentative 2: instaloader si gallery-dl a échoué
+                        if not file_paths:
+                            logger.info("[job %s] Gallery-dl a échoué — tentative instaloader", job_id)
+                            file_paths, image_count = await loop.run_in_executor(
+                                None,
+                                _download_carousel_instaloader,
+                                full_url,
+                                tmp_dir,
+                            )
+                            logger.info("[job %s] Instaloader: %d images récupérées", job_id, len(file_paths))
+
+                        if not file_paths:
+                            logger.warning("[job %s] Aucun téléchargement possible — abandon du fallback", job_id)
+                            await self._handle_error(job_id, str(exc), request.user_id, request.url)
+                            return
+
+                        content_type = ContentType.CAROUSEL
+                        duration = 0.0
+                    except Exception:
+                        await self._handle_error(job_id, str(exc), request.user_id, request.url)
+                        return
+                else:
+                    await self._handle_error(job_id, str(exc), request.user_id, request.url)
+                    return
+
+            # Log according to content type
+            if content_type == ContentType.BLOG:
+                logger.info("[job %s] Blog détecté : %d mots, ~%d min de lecture", 
+                    job_id, getattr(download_result, 'word_count', 0), getattr(download_result, 'estimated_read_time', 0))
+            elif content_type == ContentType.CAROUSEL:
                 logger.info("[job %s] Carrousel détecté : %d images", job_id, image_count)
             else:
                 logger.info("[job %s] Vidéo téléchargée : %s", job_id, file_paths[0] if file_paths else "?")
@@ -170,9 +217,17 @@ class JobProcessor:
                 entity_type = entity_type_override
                 logger.info("[job %s] Type forcé par l'utilisateur : %s", job_id, entity_type)
             else:
-                if content_type == ContentType.CAROUSEL:
-                    entity_type = 'city'
-                    logger.info("[job %s] Carrousel → analyse comme city guide", job_id)
+                if content_type == ContentType.BLOG:
+                    # For blogs, analyze the content to determine entity type
+                    await job_manager.send_sse_update(
+                        job_id, "analyzing", {"progress": 55, "message": "Analyse de l'article..."}
+                    )
+                    loop = asyncio.get_event_loop()
+                    input_path = file_paths[0] if file_paths else ""
+                    entity_type = await loop.run_in_executor(
+                        _executor, ml_service.detect_entity_type, input_path
+                    )
+                    logger.info("[job %s] Blog analysé → %s", job_id, entity_type)
                 else:
                     await job_manager.send_sse_update(
                         job_id, "analyzing", {"progress": 55, "message": "Détection du type..."}
@@ -188,7 +243,6 @@ class JobProcessor:
             if self.supabase.is_configured():
                 await self.supabase.update_job(job_id, {
                     "status": "analyzing",
-                    "entity_type": entity_type,
                 })
 
             logger.info("[job %s] Début de l'inférence (%s)", job_id, entity_type)
@@ -196,9 +250,25 @@ class JobProcessor:
             try:
                 loop = asyncio.get_event_loop()
                 if content_type == ContentType.CAROUSEL:
-                    result, duration = await loop.run_in_executor(
-                        _executor, ml_service.run_city_inference_from_images, file_paths
-                    )
+                    if entity_type == 'city':
+                        result, duration = await loop.run_in_executor(
+                            _executor, ml_service.run_city_inference_from_images, file_paths
+                        )
+                    else:
+                        result, duration = await loop.run_in_executor(
+                            _executor, ml_service.run_inference_from_images, file_paths
+                        )
+                elif content_type == ContentType.BLOG:
+                    # For blogs, use the text content for inference
+                    input_path = file_paths[0] if file_paths else ""
+                    if entity_type == 'city':
+                        result, duration = await loop.run_in_executor(
+                            _executor, ml_service.run_city_inference, input_path
+                        )
+                    else:
+                        result, duration = await loop.run_in_executor(
+                            _executor, ml_service.run_inference, input_path
+                        )
                 else:
                     input_path = file_paths[0] if file_paths else ""
                     if entity_type == 'city':
@@ -241,15 +311,36 @@ class JobProcessor:
                 result["source_url"] = full_url
                 result["content_type"] = content_type.value
                 result["image_count"] = image_count
+                
+                # Add blog-specific fields
+                if content_type == ContentType.BLOG:
+                    result["word_count"] = getattr(download_result, 'word_count', None)
+                    result["estimated_read_time"] = getattr(download_result, 'estimated_read_time', None)
 
                 if entity_type == 'city':
                     city_id = await self.supabase.create_city(
                         result, job_id, request.user_id
                     )
+                    if city_id is None:
+                        await self._handle_error(
+                            job_id,
+                            "Échec de la sauvegarde dans la base de données. Vérifiez les logs du serveur.",
+                            request.user_id,
+                            full_url,
+                        )
+                        return
                 else:
                     trip_id = await self.supabase.create_trip(
                         result, job_id, request.user_id
                     )
+                    if trip_id is None:
+                        await self._handle_error(
+                            job_id,
+                            "Échec de la sauvegarde dans la base de données. Vérifiez les logs du serveur.",
+                            request.user_id,
+                            full_url,
+                        )
+                        return
 
             # ── Terminé ─────────────────────────────────────────────────────
             response_data = {
@@ -264,23 +355,29 @@ class JobProcessor:
                 "source_url": full_url,
             }
 
+            # Add blog-specific fields to response
+            if content_type == ContentType.BLOG:
+                response_data["word_count"] = getattr(download_result, 'word_count', None)
+                response_data["estimated_read_time"] = getattr(download_result, 'estimated_read_time', None)
+
             job_manager.update_job_status(job_id, "done", result=response_data)
             await job_manager.send_sse_update(
                 job_id, "done", {"result": response_data, "progress": 100}
             )
 
             if self.supabase.is_configured():
-                update_data = {
+                update_data: Dict = {
                     "status": "done",
-                    "completed_at": datetime.utcnow().isoformat(),
-                    "duration_seconds": duration,
-                    "entity_type": entity_type,
                     "content_type": content_type.value,
                     "image_count": image_count,
+                    "entity_type": entity_type,
                 }
                 if city_id:
                     update_data["city_id"] = city_id
-                await self.supabase.update_job(job_id, update_data)
+                try:
+                    await self.supabase.update_job(job_id, update_data)
+                except Exception as update_exc:
+                    logger.error("[job %s] Erreur mise à jour job dans Supabase: %s", job_id, update_exc)
 
             logger.info("[job %s] Terminé en %.2fs (type=%s)", job_id, duration, entity_type)
 

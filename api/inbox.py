@@ -28,6 +28,10 @@ class InboxJob(BaseModel):
     tripId: Optional[str]
     cityId: Optional[str]
     entityType: str  # 'trip' | 'city'
+    contentType: Optional[str] = None
+    imageCount: Optional[int] = None
+    wordCount: Optional[int] = None
+    estimatedReadTime: Optional[int] = None
     title: str
     sourceUrl: str
     platform: str
@@ -112,6 +116,14 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
             return "tiktok"
         if "instagram.com" in url.lower():
             return "instagram"
+        # Blog detection
+        url_lower = url.lower()
+        blog_domains = ["medium.com", "substack.com", "wordpress.com", "blogspot.com"]
+        for domain in blog_domains:
+            if domain in url_lower:
+                return "blog"
+        if "/blog/" in url_lower or "/article/" in url_lower:
+            return "blog"
         return "unknown"
 
     result = []
@@ -141,6 +153,10 @@ async def get_inbox(user_id: str = Depends(get_current_user_id)) -> List[InboxJo
             tripId=trip["id"] if trip else None,
             cityId=city_id,
             entityType=entity_type,
+            contentType=job.get("content_type"),
+            imageCount=job.get("image_count"),
+            wordCount=job.get("word_count"),
+            estimatedReadTime=job.get("estimated_read_time"),
             title=title,
             sourceUrl=job["source_url"] or "",
             platform=detect_platform(job["source_url"] or ""),

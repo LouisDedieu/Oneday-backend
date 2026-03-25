@@ -40,7 +40,7 @@ Return ONLY a raw JSON object (no markdown, no commentary) with this exact struc
   "logistics": [
     {
       "from": "string", "to": "string",
-      "mode": "plane|train|bus|car|ferry|walk|other",
+      "mode": "plane|train|bus|voiture|ferry|autre",
       "duration": "string", "cost": "string", "tips": "string"
     }
   ],
@@ -72,6 +72,7 @@ Return ONLY a raw JSON object (no markdown, no commentary) with this exact struc
 Rules:
 - Use null for missing numeric values, empty array [] for missing lists.
 - Include every place, restaurant, hotel and tip visible or mentioned in the video.
+- For transport modes, use FRENCH values: "avion" (plane), "train", "bus", "voiture" (car), "ferry", "autre" (other/walk).
 - Output ONLY the JSON object. No text before or after.
 """
 

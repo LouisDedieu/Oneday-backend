@@ -12,6 +12,7 @@ class ErrorCode(str, Enum):
     VIDEO_TOO_LONG = "VIDEO_TOO_LONG"
     INFERENCE_ERROR = "INFERENCE_ERROR"
     MODEL_NOT_LOADED = "MODEL_NOT_LOADED"
+    MODEL_HIGH_DEMAND = "MODEL_HIGH_DEMAND"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
 
     # Resource errors
@@ -56,6 +57,7 @@ ERROR_MESSAGES = {
     ErrorCode.VIDEO_TOO_LONG: "Cette vidéo dépasse la durée maximale de 5 minutes",
     ErrorCode.INFERENCE_ERROR: "Erreur lors de l'analyse de la vidéo",
     ErrorCode.MODEL_NOT_LOADED: "Le modèle n'est pas encore chargé",
+    ErrorCode.MODEL_HIGH_DEMAND: "Le modèle d'IA est surchargé, réessayez dans quelques minutes",
     ErrorCode.SERVICE_UNAVAILABLE: "Le service n'est pas disponible",
     ErrorCode.TRIP_NOT_FOUND: "Voyage introuvable",
     ErrorCode.CITY_NOT_FOUND: "Ville introuvable",

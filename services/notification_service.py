@@ -356,5 +356,8 @@ class NotificationService:
             return ErrorCode.INFERENCE_ERROR.value
         if "trop longue" in error_msg_lower or "too long" in error_msg_lower:
             return ErrorCode.VIDEO_TOO_LONG.value
+        if ("high demand" in error_msg_lower or "surchargé" in error_msg_lower
+            or "503" in error_msg_lower or "unavailable" in error_msg_lower):
+            return ErrorCode.MODEL_HIGH_DEMAND.value
 
         return ErrorCode.UNKNOWN_ERROR.value
