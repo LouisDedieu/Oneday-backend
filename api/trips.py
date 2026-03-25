@@ -3,7 +3,7 @@ Routes pour la gestion des trips (voyages)
 """
 import logging
 import asyncio
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel
@@ -353,45 +353,63 @@ async def _geocode_trip_in_background(trip_id: str) -> None:
 
     sb = _supabase_service.supabase_client
     geocoded_spots = 0
-    geocoded_destinations = 0
 
     try:
-        # Récupérer les jours validés avec leur location et coordonnées
+        logger.info(f"[GEOCODE] Starting background geocoding for trip {trip_id}")
+
+        # Récupérer les jours validés avec leur location et destination
         days_res = sb.from_("itinerary_days") \
-            .select("id, location, latitude, longitude") \
+            .select("id, location, destination_id") \
             .eq("trip_id", trip_id) \
             .eq("validated", True) \
             .execute()
         valid_days = days_res.data or []
 
+        logger.info(f"[GEOCODE] Found {len(valid_days)} valid days for trip {trip_id}")
+
         if not valid_days:
-            logger.info(f"No valid days found for trip {trip_id}, skipping geocoding")
+            logger.warning(f"[GEOCODE] No valid days found for trip {trip_id}, skipping geocoding")
             return
 
         valid_day_ids = [d["id"] for d in valid_days]
         day_location_map = {d["id"]: d.get("location") for d in valid_days}
+        day_dest_map = {d["id"]: d.get("destination_id") for d in valid_days}
 
-        # 1. Geocoder les destinations (jours) sans coordonnées
-        async def update_day_coords(day_id: str, lat: float, lon: float):
-            await asyncio.to_thread(
-                lambda: sb.from_("itinerary_days")
-                    .update({"latitude": lat, "longitude": lon})
-                    .eq("id", day_id)
-                    .execute()
-            )
+        # Récupérer la destination pour avoir le context ville/pays
+        dest_res = sb.from_("destinations") \
+            .select("id, city, country") \
+            .eq("trip_id", trip_id) \
+            .execute()
+        destinations = dest_res.data or []
+        
+        # Créer un mapping destination_id -> (city, country) pour fallback
+        dest_location_map: Dict[str, str] = {}
+        for dest in destinations:
+            if dest.get("city"):
+                country = dest.get("country") or ""
+                context = f"{dest['city']}, {country}" if country else dest["city"]
+                dest_location_map[dest["id"]] = context
+        
+        # Créer un mapping day_id -> destination context pour les spots
+        day_country_map: Dict[str, str] = {}
+        for day_id, dest_id in day_dest_map.items():
+            if dest_id and dest_id in dest_location_map:
+                day_country_map[day_id] = dest_location_map[dest_id]
+        
+        logger.info(f"[GEOCODE] Found {len(destinations)} destinations: {dest_location_map}")
+        logger.info(f"[GEOCODE] Day -> Country map: {day_country_map}")
 
-        dest_results = await batch_geocode_destinations(
-            destinations=valid_days,
-            update_callback=update_day_coords,
-        )
-        geocoded_destinations = len(dest_results)
-
-        # 2. Récupérer et geocoder les spots sans coordonnées
+        # Récupérer et geocoder les spots sans coordonnées
         spots_res = sb.from_("spots") \
-            .select("id, name, address, latitude, longitude, itinerary_day_id") \
+            .select("id, name, address, itinerary_day_id") \
             .in_("itinerary_day_id", valid_day_ids) \
             .execute()
         all_spots = spots_res.data or []
+        logger.info(f"[GEOCODE] Found {len(all_spots)} spots for {len(valid_day_ids)} days")
+        
+        # Log des spots pour debug
+        for spot in all_spots[:3]:  # Log first 3 spots
+            logger.info(f"[GEOCODE] Spot '{spot.get('name')}'")
 
         async def update_spot_coords(spot_id: str, lat: float, lon: float):
             await asyncio.to_thread(
@@ -401,25 +419,36 @@ async def _geocode_trip_in_background(trip_id: str) -> None:
                     .execute()
             )
 
-        # Grouper les spots par location et geocoder
-        spots_by_location: Dict[str, List] = {}
+        # Grouper les spots par location context (via le jour) avec fallback pays
+        spots_by_location: Dict[str, Tuple[List, Optional[str]]] = {}  # location -> (spots, fallback_country)
+        spots_without_location = 0
         for spot in all_spots:
             day_id = spot.get("itinerary_day_id")
             location = day_location_map.get(day_id)
+            fallback_country = day_country_map.get(day_id)  # Pays de la destination
+            
             if location:
-                spots_by_location.setdefault(location, []).append(spot)
+                if location not in spots_by_location:
+                    spots_by_location[location] = ([], fallback_country)
+                spots_by_location[location][0].append(spot)
+            else:
+                spots_without_location += 1
+        
+        if spots_without_location > 0:
+            logger.warning(f"[GEOCODE] {spots_without_location} spots skipped (no location context)")
 
-        for location, spots in spots_by_location.items():
+        for location, (spots, fallback_country) in spots_by_location.items():
             results = await batch_geocode_spots(
                 spots=spots,
                 location=location,
+                fallback_country=fallback_country,
                 update_callback=update_spot_coords,
             )
             geocoded_spots += len(results)
 
         logger.info(
             f"Background geocoding complete for trip {trip_id}: "
-            f"{geocoded_destinations} destinations, {geocoded_spots} spots"
+            f"{geocoded_spots} spots geocoded"
         )
 
     except Exception as e:
@@ -462,6 +491,7 @@ async def validate_and_save_trip(
         ).execute()
 
         # Lancer le geocoding en arrière-plan (non-bloquant)
+        logger.info(f"[VALIDATE] Scheduling background geocoding for trip {trip_id}")
         background_tasks.add_task(_geocode_trip_in_background, trip_id)
 
         if result.data:

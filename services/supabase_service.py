@@ -217,10 +217,44 @@ class SupabaseService:
 
             logger.info(f"city_to_dest_id: {city_to_dest_id}")
 
+            # Fallback: si aucune destination, créer une destination basée sur le trip_title
+            if not city_to_dest_id:
+                # Extraire le nom de ville du trip_title (ex: "5 day itinerary CRETE" -> "CRETE")
+                trip_title = trip_data.get("trip_title", "")
+                # Essayer d'extraire une ville du titre
+                city_name = "Inconnu"
+                import re
+                # Patterns courants: "X day itinerary CITY", "Trip to CITY", "CITY in X days"
+                match = re.search(r'(?i)(?:itinerary|trip to|in|to)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)', trip_title)
+                if match:
+                    city_name = match.group(1).strip().title()
+                
+                logger.warning(
+                    f"Aucune destination détectée dans l'analyse, création d'une destination fallback '{city_name}'"
+                )
+                days_count = len(trip_data.get("itinerary", [])) or trip_data.get("duration_days", 1)
+                dest_row = _sb_insert(
+                    "destinations",
+                    {
+                        "trip_id": trip_id,
+                        "city": city_name,
+                        "country": None,
+                        "days_spent": days_count,
+                        "visit_order": 1,
+                    },
+                )
+                if dest_row.get("id"):
+                    city_to_dest_id[city_name.lower()] = dest_row["id"]
+                    logger.info(f"Destination fallback créée: {dest_row['id']} ({city_name})")
+
             # 3. Itinéraire
+            fallback_dest_id = city_to_dest_id.get("inconnu") or (list(city_to_dest_id.values())[0] if city_to_dest_id else None)
             for day_data in trip_data.get("itinerary", []):
                 location = day_data.get("location")
+                # Utiliser la destination correspondante, ou le fallback "Inconnu" si aucun match
                 destination_id = city_to_dest_id.get(location.lower().strip()) if location else None
+                if not destination_id and fallback_dest_id:
+                    destination_id = fallback_dest_id
 
                 day_row_data: dict = {
                     "trip_id": trip_id,

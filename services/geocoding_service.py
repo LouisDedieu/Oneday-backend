@@ -130,11 +130,13 @@ async def geocode_spot(
     name: str,
     address: Optional[str],
     location: Optional[str],  # Day location (city name)
+    fallback_country: Optional[str] = None,  # Country for fallback (e.g., "Crete, Greece")
 ) -> Optional[Tuple[float, float]]:
     """
     Geocode a trip spot with multiple fallback strategies.
     1. Try address + location
     2. Try name + location
+    3. (Fallback) Try name + fallback_country if provided
     """
     if not location:
         logger.warning("Cannot geocode spot '%s' without location context", name)
@@ -154,6 +156,29 @@ async def geocode_spot(
     if result:
         logger.debug("Geocoded spot '%s' via name: %s", name, query)
         return result
+
+    # Strategy 3 (Fallback): Try with country context if provided
+    if fallback_country:
+        # Nettoyer le nom: supprimer préfixes courants
+        clean_name = name
+        prefixes_to_remove = ["Taverna ", "Restaurant ", "Hotel ", "Beach ", " taverna", " restaurant"]
+        for prefix in prefixes_to_remove:
+            if clean_name.lower().startswith(prefix.lower()):
+                clean_name = clean_name[len(prefix):]
+                break
+        
+        query = f"{clean_name}, {fallback_country}"
+        result = await geocode_query(query)
+        if result:
+            logger.debug("Geocoded spot '%s' via fallback: %s", name, query)
+            return result
+        
+        # Essayer avec le nom original + fallback
+        query = f"{name}, {fallback_country}"
+        result = await geocode_query(query)
+        if result:
+            logger.debug("Geocoded spot '%s' via fallback (original name): %s", name, query)
+            return result
 
     logger.warning("Could not geocode spot '%s' in %s", name, location)
     return None
@@ -286,6 +311,7 @@ async def batch_geocode_destinations(
 async def batch_geocode_spots(
     spots: List[Dict[str, Any]],
     location: Optional[str],
+    fallback_country: Optional[str] = None,
     update_callback=None,
 ) -> Dict[str, Tuple[float, float]]:
     """
@@ -295,6 +321,7 @@ async def batch_geocode_spots(
     Args:
         spots: List of spot dicts with id, name, address, latitude, longitude
         location: Location context (city name from day)
+        fallback_country: Country for fallback (e.g., "Crete, Greece")
         update_callback: Optional async function(spot_id, lat, lon) to persist results
 
     Returns:
@@ -316,14 +343,14 @@ async def batch_geocode_spots(
         logger.info("All spots already have coordinates")
         return results
 
-    logger.info("Geocoding %d spots for %s", len(to_geocode), location)
+    logger.info("Geocoding %d spots for %s (fallback: %s)", len(to_geocode), location, fallback_country)
 
     for spot in to_geocode:
         spot_id = spot["id"]
         name = spot.get("name", "")
         address = spot.get("address")
 
-        coords = await geocode_spot(name, address, location)
+        coords = await geocode_spot(name, address, location, fallback_country)
 
         if coords:
             lat, lon = coords
